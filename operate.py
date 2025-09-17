@@ -233,86 +233,89 @@ class Operate:
     # These numbers specify how fast to power the left and right wheels
     # The numbers must be between -1 (full speed backward) and 1 (full speed forward). 0 means stop.
     # Study the code in connect.py for more information
+    def handle_event(self, event):
+        # drive forward
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_UP:
+            self.command['wheel_speed'] = [0.3, 0.3]
+             # TODO
+        # drive backward
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
+            self.command['wheel_speed'] = [-0.3,-0.3]
+             # TODO
+        # turn left
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_LEFT:
+            self.command['wheel_speed'] = [-0.3,0.3]
+             # TODO
+        # drive right
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_RIGHT:
+            self.command['wheel_speed'] = [0.3,-0.3]
+             # TODO
+        # stop
+        elif event.type == pygame.KEYUP or (event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE):
+            self.command['wheel_speed'] = [0, 0]
+        # run SLAM
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_RETURN:
+            n_observed_markers = len(self.ekf.taglist)
+            if n_observed_markers == 0:
+                if not self.ekf_on:
+                    self.notification = 'SLAM is running'
+                    self.ekf_on = True
+                else:
+                    self.notification = '>2 landmarks is required for pausing'
+            elif n_observed_markers < 3:
+                self.notification = '>2 landmarks is required for pausing'
+            else:
+                if not self.ekf_on:
+                    self.request_recover_robot = True
+                self.ekf_on = not self.ekf_on
+                if self.ekf_on:
+                    self.notification = 'SLAM is running'
+                else:
+                    self.notification = 'SLAM is paused'
+        # save SLAM map
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_s:
+            self.command['save_slam'] = True
+        # reset SLAM map
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_r:
+            if self.double_reset_comfirm == 0:
+                self.notification = 'Press again to confirm CLEAR MAP'
+                self.double_reset_comfirm +=1
+            elif self.double_reset_comfirm == 1:
+                self.notification = 'SLAM Map is cleared'
+                self.double_reset_comfirm = 0
+                self.ekf.reset()
+        # run object/fruit detector
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_p:
+            self.command['run_obj_detector'] = True
+        # save object detection outputs
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_n:
+            self.command['save_obj_detector'] = True
+        # capture and save raw image
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_i:
+            self.command['save_image'] = True
+        # load SLAM map (true map) into EKF
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_l:
+            try:
+                self.ekf.load_map(os.path.join(self.lab_output_dir, 'slam.txt'))
+                self.notification = 'Loaded map from lab_output/slam.txt'
+            except Exception as e:
+                self.notification = f'Load map failed: {e}'
+
+        # toggle localization-only (freeze map) mode
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_f:
+            self.ekf.set_localization_only(not self.ekf.localization_only)
+            self.notification = ('Mode: LOCALIZATION-ONLY (map frozen)'
+                                if self.ekf.localization_only else
+                                'Mode: SLAM (map can update)')
+        # quit
+        elif event.type == pygame.QUIT:
+            self.quit = True
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            self.quit = True
+
     def update_keyboard(self):
         for event in pygame.event.get():
-            # drive forward
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_UP:
-                self.command['wheel_speed'] = [0.3, 0.3]
-                 # TODO
-            # drive backward
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
-                self.command['wheel_speed'] = [-0.3,-0.3]
-                 # TODO
-            # turn left
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_LEFT:
-                self.command['wheel_speed'] = [-0.3,0.3]
-                 # TODO
-            # drive right
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_RIGHT:
-                self.command['wheel_speed'] = [0.3,-0.3]
-                 # TODO
-            # stop
-            elif event.type == pygame.KEYUP or (event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE):
-                self.command['wheel_speed'] = [0, 0]
-            # run SLAM
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_RETURN:
-                n_observed_markers = len(self.ekf.taglist)
-                if n_observed_markers == 0:
-                    if not self.ekf_on:
-                        self.notification = 'SLAM is running'
-                        self.ekf_on = True
-                    else:
-                        self.notification = '>2 landmarks is required for pausing'
-                elif n_observed_markers < 3:
-                    self.notification = '>2 landmarks is required for pausing'
-                else:
-                    if not self.ekf_on:
-                        self.request_recover_robot = True
-                    self.ekf_on = not self.ekf_on
-                    if self.ekf_on:
-                        self.notification = 'SLAM is running'
-                    else:
-                        self.notification = 'SLAM is paused' 
-            # save SLAM map
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_s:
-                self.command['save_slam'] = True
-            # reset SLAM map
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_r:
-                if self.double_reset_comfirm == 0:
-                    self.notification = 'Press again to confirm CLEAR MAP'
-                    self.double_reset_comfirm +=1
-                elif self.double_reset_comfirm == 1:
-                    self.notification = 'SLAM Map is cleared'
-                    self.double_reset_comfirm = 0
-                    self.ekf.reset()          
-            # run object/fruit detector
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_p:
-                self.command['run_obj_detector'] = True
-            # save object detection outputs
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_n:
-                self.command['save_obj_detector'] = True
-            # capture and save raw image
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_i:
-                self.command['save_image'] = True
-            # load SLAM map (true map) into EKF
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_l:
-                try:
-                    self.ekf.load_map(os.path.join(self.lab_output_dir, 'slam.txt'))
-                    self.notification = 'Loaded map from lab_output/slam.txt'
-                except Exception as e:
-                    self.notification = f'Load map failed: {e}'
-
-            # toggle localization-only (freeze map) mode
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_f:
-                self.ekf.set_localization_only(not self.ekf.localization_only)
-                self.notification = ('Mode: LOCALIZATION-ONLY (map frozen)'
-                                    if self.ekf.localization_only else
-                                    'Mode: SLAM (map can update)')
-            # quit
-            elif event.type == pygame.QUIT:
-                self.quit = True
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                self.quit = True
+            self.handle_event(event)
         if self.quit:
             pygame.quit()
             sys.exit()

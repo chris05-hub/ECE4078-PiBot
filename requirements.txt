@@ -1,0 +1,13 @@
+numpy==1.23.5
+matplotlib==3.5.2
+scipy==1.15.3
+spatialmath-python==1.1.14
+ansitable==0.11.4
+machinevision-toolbox-python==0.5.5
+requests==2.31.0
+pygame==2.1.2
+torch==1.12.1
+torchvision==0.13.1
+tqdm==4.64.0
+h5py==3.7.0
+PyQt5==5.15.9

@@ -403,16 +403,37 @@ class Operate:
                 # Stop moving after re-localization completes
                 self.command['wheel_speed'] = [0, 0]
 
-                # Clear the path and target to stop autonomous movement
-                self.path = []
-                self.current_path_index = 0
-                self.target_point = None
-
                 self.in_relocalization = False
                 self.reset_rotation_variables()
                 self.last_relocalization_time = time.time()
-                self.autonomous_mode = False  # Stop autonomous mode
-                self.notification = f"Re-localized! Found {len(self.ekf.taglist)} markers. Stopped - click map to set new goal"
+
+                resume_msg = f"Re-localized! Found {len(self.ekf.taglist)} markers."
+
+                resumed = False
+
+                if self.saved_target is not None:
+                    if self.plan_path_to_target(self.saved_target):
+                        self.autonomous_mode = True
+                        self.target_point = self.saved_target
+                        self.notification = resume_msg + " Re-planned route to target."
+                        resumed = True
+                    else:
+                        self.notification = resume_msg + " Unable to re-plan path, trying saved route."
+
+                if not resumed and self._restore_saved_path():
+                    self.notification = resume_msg + " Resuming saved path."
+                    resumed = True
+
+                if not resumed:
+                    self.autonomous_mode = False
+                    self.path = []
+                    self.current_path_index = 0
+                    self.target_point = None
+                    self.notification = resume_msg + " Awaiting new goal."
+
+                self.saved_path = []
+                self.saved_path_index = 0
+                self.saved_target = None
 
     def perform_step_wise_rotation(self, now, is_initial=True):
         if self.step_start_time is None:
@@ -486,6 +507,49 @@ class Operate:
             self.notification = f"A* Path: {len(self.path)} waypoints"
 
         self.current_path_index = 0
+        return True
+
+    def _restore_saved_path(self):
+        if not self.saved_path:
+            return False
+
+        self.path = self.saved_path.copy()
+
+        if not self.path:
+            return False
+
+        rx = float(self.ekf.robot.state[0, 0])
+        ry = float(self.ekf.robot.state[1, 0])
+
+        start_idx = min(max(self.saved_path_index, 0), len(self.path) - 1)
+        best_idx = start_idx
+        best_dist = float('inf')
+
+        for idx in range(start_idx, len(self.path)):
+            px, py = self.path[idx]
+            dist = np.hypot(px - rx, py - ry)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+            if best_dist <= self.wp_reached_radius * 0.5:
+                break
+
+        self.current_path_index = best_idx
+
+        # Skip waypoints that we are already on top of after re-localization
+        while (
+            self.current_path_index < len(self.path) - 1 and
+            np.hypot(self.path[self.current_path_index][0] - rx,
+                     self.path[self.current_path_index][1] - ry) <= self.wp_reached_radius * 0.5
+        ):
+            self.current_path_index += 1
+
+        if self.saved_target is not None:
+            self.target_point = self.saved_target
+        else:
+            self.target_point = self.path[-1]
+
+        self.autonomous_mode = True
         return True
 
     def _find_lookahead_target(self, pose, path, lookahead):

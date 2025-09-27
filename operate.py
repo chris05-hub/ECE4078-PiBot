@@ -554,29 +554,47 @@ class Operate:
 
     def _find_lookahead_target(self, pose, path, lookahead):
         rx, ry = pose[0], pose[1]
-        start_idx = max(0, self.current_path_index)
+        lookahead_sq = max(lookahead * lookahead, 1e-6)
+        best_target = None
+        best_index = self.current_path_index
 
-        acc_dist = 0.0
+        start_idx = max(self.current_path_index - 1, 0)
+        robot_pos = np.array([rx, ry], dtype=float)
+
         for i in range(start_idx, len(path) - 1):
             p = np.array(path[i], dtype=float)
             q = np.array(path[i + 1], dtype=float)
-            seg = q - p
-            seg_len = np.linalg.norm(seg)
-            if seg_len < 1e-6:
+            d = q - p
+            seg_len_sq = float(np.dot(d, d))
+            if seg_len_sq < 1e-8:
                 continue
 
-            d_to_p = np.hypot(rx - p[0], ry - p[1])
-            d_to_q = np.hypot(rx - q[0], ry - q[1])
+            f = p - robot_pos
+            a = seg_len_sq
+            b = 2.0 * float(np.dot(f, d))
+            c = float(np.dot(f, f)) - lookahead_sq
+            discriminant = b * b - 4.0 * a * c
+            if discriminant < 0:
+                continue
 
-            if d_to_p <= lookahead <= d_to_q:
-                return float(q[0]), float(q[1]), i + 1
+            sqrt_disc = float(np.sqrt(discriminant))
+            t_candidates = [(-b - sqrt_disc) / (2.0 * a), (-b + sqrt_disc) / (2.0 * a)]
 
-            acc_dist += seg_len
-            if acc_dist >= lookahead:
-                return float(q[0]), float(q[1]), i + 1
+            for t in t_candidates:
+                if 0.0 <= t <= 1.0:
+                    candidate = p + t * d
+                    best_target = candidate
+                    best_index = i + (1 if t >= 0.999 else 0)
+                    break
 
-        gx, gy = path[-1]
-        return float(gx), float(gy), len(path) - 1
+            if best_target is not None:
+                break
+
+        if best_target is None:
+            best_target = np.array(path[-1], dtype=float)
+            best_index = len(path) - 1
+
+        return float(best_target[0]), float(best_target[1]), best_index
 
     def follow_path(self):
         if self.in_relocalization:
@@ -601,6 +619,23 @@ class Operate:
                 self.notification = "Reached target!"
                 self.autonomous_mode = False
                 return
+
+        # Keep the active waypoint aligned with the closest point on the path ahead
+        nearest_idx = self.current_path_index
+        nearest_dist = float('inf')
+        search_start = max(self.current_path_index - 1, 0)
+        for idx in range(search_start, len(self.path)):
+            px, py = self.path[idx]
+            dist = np.hypot(px - robot_x, py - robot_y)
+            if dist < nearest_dist:
+                nearest_dist = dist
+                nearest_idx = idx
+            # stop searching once we are comfortably ahead along the route
+            if dist <= self.lookahead:
+                break
+
+        if nearest_idx > self.current_path_index:
+            self.current_path_index = nearest_idx
 
         if not self.use_pure_pursuit:
             target_x, target_y = self.path[self.current_path_index]

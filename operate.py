@@ -174,6 +174,44 @@ def smooth_world_path(path_world, world_to_grid_fn, has_los_fn):
     return cleaned
 
 
+def densify_path(path_world, spacing):
+    """Insert intermediate waypoints so consecutive points remain close."""
+    if len(path_world) < 2:
+        return path_world
+
+    spacing = max(1e-3, float(spacing))
+    dense_path = [path_world[0]]
+
+    for idx in range(1, len(path_world)):
+        start = np.array(dense_path[-1], dtype=float)
+        end = np.array(path_world[idx], dtype=float)
+        segment = end - start
+        seg_len = float(np.linalg.norm(segment))
+
+        if seg_len < spacing:
+            if np.linalg.norm(end - np.array(dense_path[-1], dtype=float)) > 1e-6:
+                dense_path.append((float(end[0]), float(end[1])))
+            continue
+
+        direction = segment / seg_len
+        steps = int(np.floor(seg_len / spacing))
+
+        for step in range(1, steps + 1):
+            point = start + direction * min(seg_len, step * spacing)
+            dense_path.append((float(point[0]), float(point[1])))
+
+        if np.linalg.norm(np.array(dense_path[-1], dtype=float) - end) > 1e-6:
+            dense_path.append((float(end[0]), float(end[1])))
+
+    # Remove any duplicates that may have been appended at segment boundaries
+    cleaned = [dense_path[0]]
+    for point in dense_path[1:]:
+        if np.linalg.norm(np.array(point) - np.array(cleaned[-1])) > 1e-6:
+            cleaned.append(point)
+
+    return cleaned
+
+
 # ===============================
 #     Operate (Combined System)
 # ===============================
@@ -201,6 +239,7 @@ class Operate:
         self.true_map = self.load_true_map()
         self.grid_resolution = 0.05
         self.grid_size = int(2.5 / self.grid_resolution)
+        self.grid_origin = np.array([-1.25, -1.25], dtype=float)
         self.occupancy_grid = np.zeros((self.grid_size, self.grid_size))
         self.path_grid = []
         self.obstacle_radius_m = 0.22
@@ -254,11 +293,12 @@ class Operate:
         # Smoothing
         self.enable_smoothing = True
         self.smoothing_iterations = 2
+        self.path_densify_spacing = 0.06
 
         # Pure pursuit
         self.use_pure_pursuit = True
-        self.lookahead = 0.25
-        self.pp_max_linear = 0.25  # Reduced from 0.5 to 0.25 (half speed)
+        self.lookahead = 0.18
+        self.pp_max_linear = 0.23  # Reduced top speed for tighter tracking
         self.pp_max_angular = 0.8
         self.pp_speed_gain = 1.2
         self.wp_reached_radius = 0.12
@@ -297,28 +337,33 @@ class Operate:
     def create_occupancy_grid(self):
         self.occupancy_grid = np.zeros((self.grid_size, self.grid_size), dtype=np.uint8)
         obstacle_radius = self.obstacle_radius_m
-        grid_radius = max(1, int(obstacle_radius / self.grid_resolution))
+        grid_radius = max(1, int(np.ceil(obstacle_radius / self.grid_resolution)))
 
         for _, pos in self.true_map.items():
-            grid_x = int((pos['x'] + 1.25) / self.grid_resolution)
-            grid_y = int((pos['y'] + 1.25) / self.grid_resolution)
+            grid_y, grid_x = self.world_to_grid((pos['x'], pos['y']))
             for dx in range(-grid_radius, grid_radius + 1):
                 for dy in range(-grid_radius, grid_radius + 1):
-                    if dx*dx + dy*dy <= grid_radius*grid_radius:
+                    if dx * dx + dy * dy <= grid_radius * grid_radius:
                         nx, ny = grid_x + dx, grid_y + dy
                         if 0 <= nx < self.grid_size and 0 <= ny < self.grid_size:
                             self.occupancy_grid[ny, nx] = 1
 
+        if hasattr(self, 'pathfinder'):
+            self.pathfinder.set_grid(self.occupancy_grid)
+
     def world_to_grid(self, world_pos):
-        grid_x = int((world_pos[0] + 1.25) / self.grid_resolution)
-        grid_y = int((world_pos[1] + 1.25) / self.grid_resolution)
-        grid_x = max(0, min(grid_x, self.grid_size - 1))
-        grid_y = max(0, min(grid_y, self.grid_size - 1))
-        return (grid_y, grid_x)
+        wx, wy = float(world_pos[0]), float(world_pos[1])
+        gx = (wx - self.grid_origin[0]) / self.grid_resolution
+        gy = (wy - self.grid_origin[1]) / self.grid_resolution
+        col = int(np.clip(np.floor(gx), 0, self.grid_size - 1))
+        row = int(np.clip(np.floor(gy), 0, self.grid_size - 1))
+        return (row, col)
 
     def grid_to_world(self, grid_pos):
-        world_x = grid_pos[1] * self.grid_resolution - 1.25
-        world_y = grid_pos[0] * self.grid_resolution - 1.25
+        col = float(grid_pos[1])
+        row = float(grid_pos[0])
+        world_x = self.grid_origin[0] + (col + 0.5) * self.grid_resolution
+        world_y = self.grid_origin[1] + (row + 0.5) * self.grid_resolution
         return (world_x, world_y)
 
     def start_localization(self):
@@ -467,16 +512,26 @@ class Operate:
         self.path_grid = self.pathfinder.simplify(self.path_grid)
         self.path = [self.grid_to_world(gp) for gp in self.path_grid]
 
+        smoothing_msg = ""
         if self.enable_smoothing:
             original_length = len(self.path)
-            self.path = smooth_world_path(
+            smoothed_path = smooth_world_path(
                 self.path,
                 self.world_to_grid,
                 self.pathfinder.has_line_of_sight
             )
-            self.notification = f"A* Path: {original_length} → {len(self.path)} waypoints (smoothed)"
-        else:
-            self.notification = f"A* Path: {len(self.path)} waypoints"
+            self.path = smoothed_path
+            smoothing_msg = f" smoothed {original_length}→{len(self.path)}."
+
+        densify_before = len(self.path)
+        self.path = densify_path(self.path, self.path_densify_spacing)
+        if len(self.path) != densify_before:
+            smoothing_msg += f" densified {densify_before}→{len(self.path)}."
+
+        if not smoothing_msg:
+            smoothing_msg = f" {len(self.path)} waypoints."
+
+        self.notification = "A* Path:" + smoothing_msg
 
         self.current_path_index = 0
         self.require_heading_alignment = len(self.path) > 1
@@ -688,7 +743,10 @@ class Operate:
             Ld = max(0.05, effective_lookahead)
             kappa = (2.0 * y_r) / (Ld * Ld)
 
+            curvature = abs(kappa)
             v = min(self.pp_max_linear, max(0.0, dist_to_goal * self.pp_speed_gain))
+            if curvature > 1e-6:
+                v = min(v, self.pp_max_linear / (1.0 + 2.5 * curvature))
             if self.current_path_index < len(self.path) - 1 and v < 0.08:
                 v = min(self.pp_max_linear, 0.08)
             omega = np.clip(v * kappa, -self.pp_max_angular, self.pp_max_angular)

@@ -294,6 +294,7 @@ class Operate:
         self.lookahead = 0.25
         self.pp_max_linear = 0.25  # Reduced from 0.5 to 0.25 (half speed)
         self.pp_max_angular = 0.8
+        self.pp_speed_gain = 1.2
         self.wp_reached_radius = 0.12
 
         # UI state
@@ -610,12 +611,29 @@ class Operate:
         robot_x = float(self.ekf.robot.state[0, 0])
         robot_y = float(self.ekf.robot.state[1, 0])
         robot_theta = float(self.ekf.robot.state[2, 0])
+        goal_x, goal_y = self.path[-1]
+        dist_to_goal = np.hypot(goal_x - robot_x, goal_y - robot_y)
 
         tx, ty = self.path[self.current_path_index]
         if np.hypot(tx - robot_x, ty - robot_y) < self.wp_reached_radius:
             self.current_path_index += 1
             if self.current_path_index >= len(self.path):
                 self.command['wheel_speed'] = [0, 0]
+                self.notification = "Reached target!"
+                self.autonomous_mode = False
+                return
+
+        if (
+            self.current_path_index >= len(self.path) - 1
+            and len(self.path) >= 2
+        ):
+            prev_wp = self.path[-2]
+            seg = np.array([goal_x - prev_wp[0], goal_y - prev_wp[1]])
+            to_robot = np.array([robot_x - prev_wp[0], robot_y - prev_wp[1]])
+            seg_len_sq = float(np.dot(seg, seg))
+            if seg_len_sq > 1e-8 and float(np.dot(to_robot, seg)) > seg_len_sq:
+                self.command['wheel_speed'] = [0, 0]
+                self.current_path_index = len(self.path)
                 self.notification = "Reached target!"
                 self.autonomous_mode = False
                 return
@@ -651,10 +669,14 @@ class Operate:
             right = np.clip(linear_speed + angular_speed * baseline / 2.0, -0.6, 0.6)
             self.command['wheel_speed'] = [left, right]
         else:
+            effective_lookahead = self.lookahead
+            if dist_to_goal < self.lookahead:
+                effective_lookahead = max(0.05, dist_to_goal + 0.5 * self.wp_reached_radius)
+
             lx, ly, idx = self._find_lookahead_target(
                 (robot_x, robot_y, robot_theta),
                 self.path,
-                self.lookahead
+                effective_lookahead
             )
             if idx > self.current_path_index:
                 self.current_path_index = idx
@@ -665,10 +687,12 @@ class Operate:
             x_r = np.cos(robot_theta) * dx + np.sin(robot_theta) * dy
             y_r = -np.sin(robot_theta) * dx + np.cos(robot_theta) * dy
 
-            Ld = max(0.05, self.lookahead)
+            Ld = max(0.05, effective_lookahead)
             kappa = (2.0 * y_r) / (Ld * Ld)
 
-            v = self.pp_max_linear
+            v = min(self.pp_max_linear, max(0.0, dist_to_goal * self.pp_speed_gain))
+            if self.current_path_index < len(self.path) - 1 and v < 0.08:
+                v = min(self.pp_max_linear, 0.08)
             omega = np.clip(v * kappa, -self.pp_max_angular, self.pp_max_angular)
 
             baseline = float(self.ekf.robot.baseline)

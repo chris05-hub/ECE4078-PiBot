@@ -262,6 +262,9 @@ class Operate:
         self.pp_max_angular = 0.8
         self.pp_speed_gain = 1.2
         self.wp_reached_radius = 0.12
+        self.require_heading_alignment = False
+        self.heading_align_tolerance = 0.12
+        self.heading_align_gain = 2.0
 
         # UI state
         self.quit = False
@@ -474,6 +477,7 @@ class Operate:
             self.notification = f"A* Path: {len(self.path)} waypoints"
 
         self.current_path_index = 0
+        self.require_heading_alignment = len(self.path) > 1
         return True
 
     def _restore_saved_path(self):
@@ -517,6 +521,7 @@ class Operate:
             self.target_point = self.path[-1]
 
         self.autonomous_mode = True
+        self.require_heading_alignment = len(self.path) > 1
         return True
 
     def _find_lookahead_target(self, pose, path, lookahead):
@@ -572,6 +577,7 @@ class Operate:
             if self.autonomous_mode and not self.in_relocalization:
                 self.notification = "Reached target!"
                 self.autonomous_mode = False
+            self.require_heading_alignment = False
             return
 
         robot_x = float(self.ekf.robot.state[0, 0])
@@ -587,6 +593,7 @@ class Operate:
                 self.command['wheel_speed'] = [0, 0]
                 self.notification = "Reached target!"
                 self.autonomous_mode = False
+                self.require_heading_alignment = False
                 return
 
         if (
@@ -602,6 +609,7 @@ class Operate:
                 self.current_path_index = len(self.path)
                 self.notification = "Reached target!"
                 self.autonomous_mode = False
+                self.require_heading_alignment = False
                 return
 
         # Keep the active waypoint aligned with the closest point on the path ahead
@@ -620,6 +628,27 @@ class Operate:
 
         if nearest_idx > self.current_path_index:
             self.current_path_index = nearest_idx
+
+        if self.require_heading_alignment and len(self.path) > 1:
+            align_idx = min(self.current_path_index + 1, len(self.path) - 1)
+            align_x, align_y = self.path[align_idx]
+            dx_align = align_x - robot_x
+            dy_align = align_y - robot_y
+            if np.hypot(dx_align, dy_align) > 1e-3:
+                desired_theta = np.arctan2(dy_align, dx_align)
+                angle_error = (desired_theta - robot_theta + np.pi) % (2 * np.pi) - np.pi
+                if abs(angle_error) > self.heading_align_tolerance:
+                    omega = np.clip(angle_error * self.heading_align_gain,
+                                    -self.pp_max_angular, self.pp_max_angular)
+                    baseline = float(self.ekf.robot.baseline)
+                    left = np.clip(-omega * baseline / 2.0,
+                                   -self.pp_max_linear, self.pp_max_linear)
+                    right = np.clip(omega * baseline / 2.0,
+                                    -self.pp_max_linear, self.pp_max_linear)
+                    self.command['wheel_speed'] = [left, right]
+                    self.notification = "Aligning heading to path"
+                    return
+            self.require_heading_alignment = False
 
         if not self.use_pure_pursuit:
             target_x, target_y = self.path[self.current_path_index]

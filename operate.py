@@ -294,6 +294,7 @@ class Operate:
         self.lookahead = 0.25
         self.pp_max_linear = 0.25  # Reduced from 0.5 to 0.25 (half speed)
         self.pp_max_angular = 0.8
+        self.pp_speed_gain = 1.2
         self.wp_reached_radius = 0.12
 
         # UI state
@@ -403,16 +404,37 @@ class Operate:
                 # Stop moving after re-localization completes
                 self.command['wheel_speed'] = [0, 0]
 
-                # Clear the path and target to stop autonomous movement
-                self.path = []
-                self.current_path_index = 0
-                self.target_point = None
-
                 self.in_relocalization = False
                 self.reset_rotation_variables()
                 self.last_relocalization_time = time.time()
-                self.autonomous_mode = False  # Stop autonomous mode
-                self.notification = f"Re-localized! Found {len(self.ekf.taglist)} markers. Stopped - click map to set new goal"
+
+                resume_msg = f"Re-localized! Found {len(self.ekf.taglist)} markers."
+
+                resumed = False
+
+                if self.saved_target is not None:
+                    if self.plan_path_to_target(self.saved_target):
+                        self.autonomous_mode = True
+                        self.target_point = self.saved_target
+                        self.notification = resume_msg + " Re-planned route to target."
+                        resumed = True
+                    else:
+                        self.notification = resume_msg + " Unable to re-plan path, trying saved route."
+
+                if not resumed and self._restore_saved_path():
+                    self.notification = resume_msg + " Resuming saved path."
+                    resumed = True
+
+                if not resumed:
+                    self.autonomous_mode = False
+                    self.path = []
+                    self.current_path_index = 0
+                    self.target_point = None
+                    self.notification = resume_msg + " Awaiting new goal."
+
+                self.saved_path = []
+                self.saved_path_index = 0
+                self.saved_target = None
 
     def perform_step_wise_rotation(self, now, is_initial=True):
         if self.step_start_time is None:
@@ -488,31 +510,92 @@ class Operate:
         self.current_path_index = 0
         return True
 
+    def _restore_saved_path(self):
+        if not self.saved_path:
+            return False
+
+        self.path = self.saved_path.copy()
+
+        if not self.path:
+            return False
+
+        rx = float(self.ekf.robot.state[0, 0])
+        ry = float(self.ekf.robot.state[1, 0])
+
+        start_idx = min(max(self.saved_path_index, 0), len(self.path) - 1)
+        best_idx = start_idx
+        best_dist = float('inf')
+
+        for idx in range(start_idx, len(self.path)):
+            px, py = self.path[idx]
+            dist = np.hypot(px - rx, py - ry)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+            if best_dist <= self.wp_reached_radius * 0.5:
+                break
+
+        self.current_path_index = best_idx
+
+        # Skip waypoints that we are already on top of after re-localization
+        while (
+            self.current_path_index < len(self.path) - 1 and
+            np.hypot(self.path[self.current_path_index][0] - rx,
+                     self.path[self.current_path_index][1] - ry) <= self.wp_reached_radius * 0.5
+        ):
+            self.current_path_index += 1
+
+        if self.saved_target is not None:
+            self.target_point = self.saved_target
+        else:
+            self.target_point = self.path[-1]
+
+        self.autonomous_mode = True
+        return True
+
     def _find_lookahead_target(self, pose, path, lookahead):
         rx, ry = pose[0], pose[1]
-        start_idx = max(0, self.current_path_index)
+        lookahead_sq = max(lookahead * lookahead, 1e-6)
+        best_target = None
+        best_index = self.current_path_index
 
-        acc_dist = 0.0
+        start_idx = max(self.current_path_index - 1, 0)
+        robot_pos = np.array([rx, ry], dtype=float)
+
         for i in range(start_idx, len(path) - 1):
             p = np.array(path[i], dtype=float)
             q = np.array(path[i + 1], dtype=float)
-            seg = q - p
-            seg_len = np.linalg.norm(seg)
-            if seg_len < 1e-6:
+            d = q - p
+            seg_len_sq = float(np.dot(d, d))
+            if seg_len_sq < 1e-8:
                 continue
 
-            d_to_p = np.hypot(rx - p[0], ry - p[1])
-            d_to_q = np.hypot(rx - q[0], ry - q[1])
+            f = p - robot_pos
+            a = seg_len_sq
+            b = 2.0 * float(np.dot(f, d))
+            c = float(np.dot(f, f)) - lookahead_sq
+            discriminant = b * b - 4.0 * a * c
+            if discriminant < 0:
+                continue
 
-            if d_to_p <= lookahead <= d_to_q:
-                return float(q[0]), float(q[1]), i + 1
+            sqrt_disc = float(np.sqrt(discriminant))
+            t_candidates = [(-b - sqrt_disc) / (2.0 * a), (-b + sqrt_disc) / (2.0 * a)]
 
-            acc_dist += seg_len
-            if acc_dist >= lookahead:
-                return float(q[0]), float(q[1]), i + 1
+            for t in t_candidates:
+                if 0.0 <= t <= 1.0:
+                    candidate = p + t * d
+                    best_target = candidate
+                    best_index = i + (1 if t >= 0.999 else 0)
+                    break
 
-        gx, gy = path[-1]
-        return float(gx), float(gy), len(path) - 1
+            if best_target is not None:
+                break
+
+        if best_target is None:
+            best_target = np.array(path[-1], dtype=float)
+            best_index = len(path) - 1
+
+        return float(best_target[0]), float(best_target[1]), best_index
 
     def follow_path(self):
         if self.in_relocalization:
@@ -528,6 +611,8 @@ class Operate:
         robot_x = float(self.ekf.robot.state[0, 0])
         robot_y = float(self.ekf.robot.state[1, 0])
         robot_theta = float(self.ekf.robot.state[2, 0])
+        goal_x, goal_y = self.path[-1]
+        dist_to_goal = np.hypot(goal_x - robot_x, goal_y - robot_y)
 
         tx, ty = self.path[self.current_path_index]
         if np.hypot(tx - robot_x, ty - robot_y) < self.wp_reached_radius:
@@ -537,6 +622,38 @@ class Operate:
                 self.notification = "Reached target!"
                 self.autonomous_mode = False
                 return
+
+        if (
+            self.current_path_index >= len(self.path) - 1
+            and len(self.path) >= 2
+        ):
+            prev_wp = self.path[-2]
+            seg = np.array([goal_x - prev_wp[0], goal_y - prev_wp[1]])
+            to_robot = np.array([robot_x - prev_wp[0], robot_y - prev_wp[1]])
+            seg_len_sq = float(np.dot(seg, seg))
+            if seg_len_sq > 1e-8 and float(np.dot(to_robot, seg)) > seg_len_sq:
+                self.command['wheel_speed'] = [0, 0]
+                self.current_path_index = len(self.path)
+                self.notification = "Reached target!"
+                self.autonomous_mode = False
+                return
+
+        # Keep the active waypoint aligned with the closest point on the path ahead
+        nearest_idx = self.current_path_index
+        nearest_dist = float('inf')
+        search_start = max(self.current_path_index - 1, 0)
+        for idx in range(search_start, len(self.path)):
+            px, py = self.path[idx]
+            dist = np.hypot(px - robot_x, py - robot_y)
+            if dist < nearest_dist:
+                nearest_dist = dist
+                nearest_idx = idx
+            # stop searching once we are comfortably ahead along the route
+            if dist <= self.lookahead:
+                break
+
+        if nearest_idx > self.current_path_index:
+            self.current_path_index = nearest_idx
 
         if not self.use_pure_pursuit:
             target_x, target_y = self.path[self.current_path_index]
@@ -552,10 +669,14 @@ class Operate:
             right = np.clip(linear_speed + angular_speed * baseline / 2.0, -0.6, 0.6)
             self.command['wheel_speed'] = [left, right]
         else:
+            effective_lookahead = self.lookahead
+            if dist_to_goal < self.lookahead:
+                effective_lookahead = max(0.05, dist_to_goal + 0.5 * self.wp_reached_radius)
+
             lx, ly, idx = self._find_lookahead_target(
                 (robot_x, robot_y, robot_theta),
                 self.path,
-                self.lookahead
+                effective_lookahead
             )
             if idx > self.current_path_index:
                 self.current_path_index = idx
@@ -566,10 +687,12 @@ class Operate:
             x_r = np.cos(robot_theta) * dx + np.sin(robot_theta) * dy
             y_r = -np.sin(robot_theta) * dx + np.cos(robot_theta) * dy
 
-            Ld = max(0.05, self.lookahead)
+            Ld = max(0.05, effective_lookahead)
             kappa = (2.0 * y_r) / (Ld * Ld)
 
-            v = self.pp_max_linear
+            v = min(self.pp_max_linear, max(0.0, dist_to_goal * self.pp_speed_gain))
+            if self.current_path_index < len(self.path) - 1 and v < 0.08:
+                v = min(self.pp_max_linear, 0.08)
             omega = np.clip(v * kappa, -self.pp_max_angular, self.pp_max_angular)
 
             baseline = float(self.ekf.robot.baseline)

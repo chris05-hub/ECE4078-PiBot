@@ -8,7 +8,6 @@ import pygame
 from botconnect import BotConnect
 import json
 import heapq
-from collections import deque
 
 # ---- SLAM components (M2) ----
 sys.path.insert(0, "{}/slam".format(os.getcwd()))
@@ -23,189 +22,156 @@ from cv.detector import ObjectDetector
 
 
 # ===============================
-#        A* Pathfinder (from your working code)
+#        Grid-based Pathfinder
 # ===============================
+
 class AStarPathfinder:
-    """Standard A* pathfinding on 8-connected grid"""
-    def __init__(self, grid):
-        self.grid = grid
-        self.rows, self.cols = grid.shape
-        
-    def heuristic(self, a, b):
-        dx = abs(a[0] - b[0])
-        dy = abs(a[1] - b[1])
-        return max(dx, dy) + (np.sqrt(2) - 1) * min(dx, dy)
+    """Robust 8-connected A* planner with deterministic smoothing."""
+
+    # 8-connected motion model: (dr, dc, cost)
+    _NEIGHBOR_OFFSETS = [
+        (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+        (-1, -1, np.sqrt(2)), (-1, 1, np.sqrt(2)), (1, -1, np.sqrt(2)), (1, 1, np.sqrt(2)),
+    ]
+
+    def __init__(self, grid: np.ndarray):
+        self.set_grid(grid)
+
+    def set_grid(self, grid: np.ndarray):
+        self.grid = np.array(grid, dtype=np.uint8)
+        self.rows, self.cols = self.grid.shape
+
+    @staticmethod
+    def _heuristic(a, b):
+        return np.hypot(a[0] - b[0], a[1] - b[1])
+
+    def _in_bounds(self, r, c):
+        return 0 <= r < self.rows and 0 <= c < self.cols
+
+    def _is_free(self, r, c):
+        return self.grid[r, c] == 0
 
     def get_neighbors(self, node):
         r, c = node
-        nbrs = []
-        for dr, dc in [(-1,-1), (-1,0), (-1,1), (0,-1), (0,1), (1,-1), (1,0), (1,1)]:
-            rr, cc = r + dr, c + dc
-            if 0 <= rr < self.rows and 0 <= cc < self.cols and self.grid[rr, cc] == 0:
-                nbrs.append((rr, cc))
-        return nbrs
+        for dr, dc, cost in self._NEIGHBOR_OFFSETS:
+            nr, nc = r + dr, c + dc
+            if self._in_bounds(nr, nc) and self._is_free(nr, nc):
+                yield (nr, nc), cost
 
-    def has_line_of_sight(self, a, b):
-        r0, c0 = a
-        r1, c1 = b
+    def has_line_of_sight(self, start, goal):
+        """Bresenham line check for collision free segment."""
+        r0, c0 = start
+        r1, c1 = goal
         dr = abs(r1 - r0)
         dc = abs(c1 - c0)
         sr = 1 if r1 >= r0 else -1
         sc = 1 if c1 >= c0 else -1
+        err = dr - dc
 
         r, c = r0, c0
-        if dc > dr:
-            err = dc // 2
-            while c != c1:
-                if self.grid[r, c] == 1:
-                    return False
-                c += sc
-                err -= dr
-                if err < 0:
-                    r += sr
-                    err += dc
-        else:
-            err = dr // 2
-            while r != r1:
-                if self.grid[r, c] == 1:
-                    return False
-                r += sr
+        while True:
+            if not self._is_free(r, c):
+                return False
+            if (r, c) == (r1, c1):
+                return True
+            e2 = 2 * err
+            if e2 > -dc:
                 err -= dc
-                if err < 0:
-                    c += sc
-                    err += dr
-        return self.grid[r1, c1] == 0
+                r += sr
+            if e2 < dr:
+                err += dr
+                c += sc
 
     def find_path(self, start, goal):
-        if self.grid[start[0], start[1]] != 0 or self.grid[goal[0], goal[1]] != 0:
+        if not (self._in_bounds(*start) and self._in_bounds(*goal)):
+            return []
+        if not (self._is_free(*start) and self._is_free(*goal)):
             return []
 
-        open_set = []
-        heapq.heappush(open_set, (0.0, start))
+        open_heap = [(0.0, start)]
         came_from = {}
         g_score = {start: 0.0}
-        f_score = {start: self.heuristic(start, goal)}
-        in_open = {start}
+        visited = set()
 
-        while open_set:
-            _, current = heapq.heappop(open_set)
-            in_open.discard(current)
+        while open_heap:
+            _, current = heapq.heappop(open_heap)
+            if current in visited:
+                continue
+            visited.add(current)
 
             if current == goal:
-                path = [current]
-                while current in came_from:
-                    current = came_from[current]
-                    path.append(current)
-                path.reverse()
-                return path
+                return self._reconstruct_path(came_from, current)
 
-            for neighbor in self.get_neighbors(current):
-                tentative_g = g_score[current] + self.heuristic(current, neighbor)
-
-                if neighbor not in g_score or tentative_g < g_score[neighbor]:
+            for neighbor, cost in self.get_neighbors(current):
+                tentative_g = g_score[current] + cost
+                if tentative_g < g_score.get(neighbor, float('inf')):
                     came_from[neighbor] = current
                     g_score[neighbor] = tentative_g
-                    f = tentative_g + self.heuristic(neighbor, goal)
-                    f_score[neighbor] = f
-                    if neighbor not in in_open:
-                        heapq.heappush(open_set, (f, neighbor))
-                        in_open.add(neighbor)
+                    f_score = tentative_g + self._heuristic(neighbor, goal)
+                    heapq.heappush(open_heap, (f_score, neighbor))
 
         return []
 
+    def _reconstruct_path(self, came_from, current):
+        path = [current]
+        while current in came_from:
+            current = came_from[current]
+            path.append(current)
+        path.reverse()
+        return path
 
-# ===============================
-#    Path Smoothing (from your working code)
-# ===============================
-def advanced_smooth_path(path_world, world_to_grid_fn, has_los_fn, iterations=3):
+    def simplify(self, path):
+        """Remove intermediate waypoints that are redundant."""
+        if len(path) < 3:
+            return path
+
+        simplified = [path[0]]
+        anchor_idx = 0
+
+        for idx in range(2, len(path)):
+            if not self.has_line_of_sight(path[anchor_idx], path[idx]):
+                simplified.append(path[idx - 1])
+                anchor_idx = idx - 1
+
+        simplified.append(path[-1])
+        return self._deduplicate(simplified)
+
+    @staticmethod
+    def _deduplicate(path):
+        deduped = [path[0]]
+        for point in path[1:]:
+            if point != deduped[-1]:
+                deduped.append(point)
+        return deduped
+
+
+def smooth_world_path(path_world, world_to_grid_fn, has_los_fn):
+    """Deterministic shortcutting that respects map obstacles."""
     if len(path_world) < 3:
         return path_world
-    smoothed = shortcut_path_world(path_world, world_to_grid_fn, has_los_fn, trials=200)
-    smoothed = remove_redundant_points(smoothed, world_to_grid_fn, has_los_fn)
-    smoothed = chaikin_smooth(smoothed, iterations=iterations, alpha=0.25)
-    smoothed = optimize_turning_points(smoothed, world_to_grid_fn, has_los_fn)
-    return smoothed
 
-def remove_redundant_points(path_world, world_to_grid_fn, has_los_fn, angle_threshold=0.1):
-    if len(path_world) < 3:
-        return path_world
-    result = [path_world[0]]
-    for i in range(1, len(path_world) - 1):
-        p0 = np.array(path_world[i - 1])
-        p1 = np.array(path_world[i])
-        p2 = np.array(path_world[i + 1])
-        v1 = p1 - p0
-        v2 = p2 - p1
-        n1 = np.linalg.norm(v1)
-        n2 = np.linalg.norm(v2)
-        if n1 > 1e-6 and n2 > 1e-6:
-            v1 = v1 / n1
-            v2 = v2 / n2
-            dot_product = np.clip(np.dot(v1, v2), -1.0, 1.0)
-            angle = np.arccos(dot_product)
-            if angle > angle_threshold:
-                result.append(path_world[i])
-        else:
-            result.append(path_world[i])
-    result.append(path_world[-1])
-    return result
+    simplified = [path_world[0]]
+    anchor = path_world[0]
+    anchor_grid = world_to_grid_fn(anchor)
 
-def optimize_turning_points(path_world, world_to_grid_fn, has_los_fn):
-    if len(path_world) < 3:
-        return path_world
-    result = [path_world[0]]
-    i = 1
-    while i < len(path_world):
-        best_j = i
-        max_j = min(i + 5, len(path_world) - 1)
-        for j in range(max_j, i, -1):
-            if j >= len(path_world):
-                continue
-            grid_i = world_to_grid_fn(result[-1])
-            grid_j = world_to_grid_fn(path_world[j])
-            if has_los_fn(grid_i, grid_j):
-                best_j = j
-                break
-        if best_j > i:
-            result.append(path_world[best_j])
-            i = best_j + 1
-        else:
-            result.append(path_world[i])
-            i += 1
-    if result[-1] != path_world[-1]:
-        result.append(path_world[-1])
-    return result
+    for idx in range(2, len(path_world)):
+        candidate = path_world[idx]
+        candidate_grid = world_to_grid_fn(candidate)
+        if not has_los_fn(anchor_grid, candidate_grid):
+            prev = path_world[idx - 1]
+            simplified.append(prev)
+            anchor = prev
+            anchor_grid = world_to_grid_fn(anchor)
 
-def shortcut_path_world(path_world, world_to_grid_fn, has_los_fn, trials=200):
-    if len(path_world) < 3:
-        return path_world
-    pts = path_world[:]
-    for _ in range(trials):
-        if len(pts) < 3:
-            break
-        i = np.random.randint(0, len(pts) - 2)
-        j = np.random.randint(i + 2, len(pts))
-        a_grid = world_to_grid_fn(pts[i])
-        b_grid = world_to_grid_fn(pts[j])
-        if has_los_fn(a_grid, b_grid):
-            pts = pts[:i+1] + pts[j:]
-    return pts
+    simplified.append(path_world[-1])
 
-def chaikin_smooth(path_world, iterations=1, alpha=0.25):
-    if len(path_world) < 3 or iterations <= 0:
-        return path_world
-    out = path_world[:]
-    for _ in range(iterations):
-        newp = [out[0]]
-        for k in range(len(out) - 1):
-            p = np.array(out[k], dtype=float)
-            q = np.array(out[k+1], dtype=float)
-            Q = (1 - alpha) * p + alpha * q
-            R = alpha * p + (1 - alpha) * q
-            newp.extend([tuple(Q), tuple(R)])
-        newp.append(out[-1])
-        out = newp
-    return out
+    # Remove any duplicates that may have formed
+    cleaned = [simplified[0]]
+    for pt in simplified[1:]:
+        if pt != cleaned[-1]:
+            cleaned.append(pt)
+
+    return cleaned
 
 
 # ===============================
@@ -493,15 +459,15 @@ class Operate:
             self.notification = "No path found to target!"
             return False
 
+        self.path_grid = self.pathfinder.simplify(self.path_grid)
         self.path = [self.grid_to_world(gp) for gp in self.path_grid]
 
         if self.enable_smoothing:
             original_length = len(self.path)
-            self.path = advanced_smooth_path(
+            self.path = smooth_world_path(
                 self.path,
                 self.world_to_grid,
-                self.pathfinder.has_line_of_sight,
-                iterations=self.smoothing_iterations
+                self.pathfinder.has_line_of_sight
             )
             self.notification = f"A* Path: {original_length} → {len(self.path)} waypoints (smoothed)"
         else:

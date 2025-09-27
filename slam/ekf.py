@@ -303,7 +303,7 @@ class EKF:
         y_im = int(y*m2pixel+h/2.0)
         return (x_im, y_im)
 
-    def draw_slam_state(self, res = (320, 500), not_pause=True, path=None, goal=None):
+    def draw_slam_state(self, res = (320, 500), not_pause=True):
         # Draw landmarks
         m2pixel = 100
         if not_pause:
@@ -311,7 +311,7 @@ class EKF:
         else:
             bg_rgb = np.array([120, 120, 120]).reshape(1, 1, 3)
         canvas = np.ones((res[1], res[0], 3))*bg_rgb.astype(np.uint8)
-        # in meters,
+        # in meters, 
         lms_xy = self.markers[:2, :]
         robot_xy = self.robot.state[:2, 0].reshape((2, 1))
         lms_xy = lms_xy - robot_xy
@@ -319,7 +319,7 @@ class EKF:
         robot_theta = self.robot.state[2,0]
         # plot robot
         start_point_uv = self.to_im_coor((0, 0), res, m2pixel)
-
+        
         p_robot = self.P[0:2,0:2]
         axes_len,angle = self.make_ellipse(p_robot)
         canvas = cv2.ellipse(canvas, start_point_uv, (int(axes_len[0]*m2pixel), int(axes_len[1]*m2pixel)), angle, 0, 360, (0, 30, 56), 1)
@@ -332,24 +332,6 @@ class EKF:
                 Plmi = self.P[3+2*i:3+2*(i+1),3+2*i:3+2*(i+1)]
                 axes_len, angle = self.make_ellipse(Plmi)
                 canvas = cv2.ellipse(canvas, coor_, (int(axes_len[0]*m2pixel), int(axes_len[1]*m2pixel)), angle, 0, 360, (244, 69, 96), 1)
-
-        if path:
-            pts = []
-            for world_xy in path:
-                rel = (world_xy[0] - self.robot.state[0, 0],
-                       world_xy[1] - self.robot.state[1, 0])
-                pts.append(self.to_im_coor(rel, res, m2pixel))
-            if len(pts) == 1:
-                canvas = cv2.circle(canvas, pts[0], 5, (60, 60, 200), -1)
-            elif len(pts) > 1:
-                pts_arr = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
-                canvas = cv2.polylines(canvas, [pts_arr], False, (60, 60, 200), 2)
-
-        if goal is not None:
-            rel_goal = (goal[0] - self.robot.state[0, 0],
-                        goal[1] - self.robot.state[1, 0])
-            goal_uv = self.to_im_coor(rel_goal, res, m2pixel)
-            canvas = cv2.circle(canvas, goal_uv, 6, (40, 180, 40), -1)
 
         surface = pygame.surfarray.make_surface(np.rot90(canvas))
         surface = pygame.transform.flip(surface, True, False)

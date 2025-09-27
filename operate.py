@@ -403,16 +403,39 @@ class Operate:
                 # Stop moving after re-localization completes
                 self.command['wheel_speed'] = [0, 0]
 
-                # Clear the path and target to stop autonomous movement
-                self.path = []
-                self.current_path_index = 0
-                self.target_point = None
-
                 self.in_relocalization = False
                 self.reset_rotation_variables()
                 self.last_relocalization_time = time.time()
-                self.autonomous_mode = False  # Stop autonomous mode
-                self.notification = f"Re-localized! Found {len(self.ekf.taglist)} markers. Stopped - click map to set new goal"
+
+                resume_msg = f"Re-localized! Found {len(self.ekf.taglist)} markers."
+
+                if self.saved_target is not None:
+                    if self.plan_path_to_target(self.saved_target):
+                        self.autonomous_mode = True
+                        self.target_point = self.saved_target
+                        self.notification = resume_msg + " Resuming path."
+                    else:
+                        self.autonomous_mode = False
+                        self.path = []
+                        self.current_path_index = 0
+                        self.target_point = None
+                        self.notification = resume_msg + " Unable to re-plan path."
+                elif self.saved_path:
+                    self.path = self.saved_path.copy()
+                    self.current_path_index = min(self.saved_path_index, len(self.path) - 1)
+                    self.target_point = self.saved_target
+                    self.autonomous_mode = True if self.path else False
+                    self.notification = resume_msg + " Resuming saved path."
+                else:
+                    self.autonomous_mode = False
+                    self.path = []
+                    self.current_path_index = 0
+                    self.target_point = None
+                    self.notification = resume_msg + " Awaiting new goal."
+
+                self.saved_path = []
+                self.saved_path_index = 0
+                self.saved_target = None
 
     def perform_step_wise_rotation(self, now, is_initial=True):
         if self.step_start_time is None:

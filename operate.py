@@ -265,6 +265,8 @@ class Operate:
         self.require_heading_alignment = False
         self.heading_align_tolerance = 0.12
         self.heading_align_gain = 2.0
+        self.heading_align_min_speed = 0.18
+        self.heading_align_max_speed = 0.6
 
         # UI state
         self.quit = False
@@ -638,14 +640,15 @@ class Operate:
                 desired_theta = np.arctan2(dy_align, dx_align)
                 angle_error = (desired_theta - robot_theta + np.pi) % (2 * np.pi) - np.pi
                 if abs(angle_error) > self.heading_align_tolerance:
-                    omega = np.clip(angle_error * self.heading_align_gain,
-                                    -self.pp_max_angular, self.pp_max_angular)
-                    baseline = float(self.ekf.robot.baseline)
-                    left = np.clip(-omega * baseline / 2.0,
-                                   -self.pp_max_linear, self.pp_max_linear)
-                    right = np.clip(omega * baseline / 2.0,
-                                    -self.pp_max_linear, self.pp_max_linear)
-                    self.command['wheel_speed'] = [left, right]
+                    turn_speed = np.clip(
+                        angle_error * self.heading_align_gain,
+                        -self.heading_align_max_speed,
+                        self.heading_align_max_speed,
+                    )
+                    if abs(turn_speed) < self.heading_align_min_speed:
+                        sign = 1.0 if (turn_speed if turn_speed != 0 else angle_error) >= 0 else -1.0
+                        turn_speed = self.heading_align_min_speed * sign
+                    self.command['wheel_speed'] = [-turn_speed, turn_speed]
                     self.notification = "Aligning heading to path"
                     return
             self.require_heading_alignment = False

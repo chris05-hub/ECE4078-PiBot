@@ -345,22 +345,30 @@ class Operate:
         # Pure pursuit
         self.use_pure_pursuit = True
         self.lookahead = 0.18
-        self.pp_max_linear = 0.23  # Reduced top speed for tighter tracking
+        # Pure pursuit speed limits.  The robot was previously capped at a very
+        # low forward speed (≈0.08) which was not sufficient to overcome static
+        # friction on the wheels.  As a result the robot would spin in place
+        # when a new goal was issued but barely translate towards it.  We keep a
+        # conservative maximum speed but introduce an explicit minimum cruise
+        # speed so that the controller always commands enough throttle.
+        self.pp_max_linear = 0.32
+        self.pp_min_linear = 0.16
+        self.pp_final_linear = 0.1
         self.pp_max_angular = 0.8
-        self.pp_speed_gain = 1.2
+        self.pp_speed_gain = 1.6
         self.wp_reached_radius = 0.12
         self.require_heading_alignment = False
         self.heading_align_tolerance = 0.12
         self.heading_align_gain = 2.0
-        self.heading_align_min_speed = 0.18
+        self.heading_align_min_speed = 0.12
         self.heading_align_max_speed = 0.6
         self.turn_in_place_angle = 0.55
         self.turn_in_place_gain = 2.4
-        self.turn_in_place_min_speed = 0.15
+        self.turn_in_place_min_speed = 0.12
         self.turn_in_place_max_speed = 0.65
         self.goal_align_tolerance = 0.12
         self.goal_align_gain = 2.2
-        self.goal_align_min_speed = 0.18
+        self.goal_align_min_speed = 0.12
         self.goal_align_max_speed = 0.6
 
         # UI state
@@ -850,8 +858,18 @@ class Operate:
             v = min(self.pp_max_linear, max(0.0, dist_to_goal * self.pp_speed_gain))
             if curvature > 1e-6:
                 v = min(v, self.pp_max_linear / (1.0 + 2.5 * curvature))
-            if self.current_path_index < len(self.path) - 1 and v < 0.08:
-                v = min(self.pp_max_linear, 0.08)
+
+            # Ensure we maintain enough forward motion to overcome stiction on
+            # the wheels.  Without this guard the controller could command very
+            # small speeds on long, gentle turns which caused the robot to
+            # rotate almost in place.  We keep a separate lower bound when the
+            # robot is approaching the final waypoint so that it still slows
+            # down for the stop condition handled above.
+            if self.current_path_index < len(self.path) - 1:
+                min_speed = self.pp_min_linear if dist_to_goal > self.wp_reached_radius else self.pp_final_linear
+                v = max(min_speed, v)
+            else:
+                v = max(min(v, self.pp_final_linear), self.pp_final_linear)
             omega = np.clip(v * kappa, -self.pp_max_angular, self.pp_max_angular)
 
             baseline = float(self.ekf.robot.baseline)

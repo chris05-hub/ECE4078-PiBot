@@ -558,24 +558,6 @@ class Operate:
         start_grid = self.world_to_grid(robot_pos)
         goal_grid = self.world_to_grid(target_world)
 
-        original_start = start_grid
-        original_goal = goal_grid
-
-        start_grid_adjusted = self.pathfinder.find_nearest_free(start_grid, max_radius=6)
-        goal_grid_adjusted = self.pathfinder.find_nearest_free(goal_grid, max_radius=10)
-
-        if start_grid_adjusted is None or goal_grid_adjusted is None:
-            self.notification = "No navigable space near start or goal!"
-            return False
-
-        start_grid = start_grid_adjusted
-        goal_grid = goal_grid_adjusted
-        adjustments = []
-        if start_grid != original_start:
-            adjustments.append("start")
-        if goal_grid != original_goal:
-            adjustments.append("goal")
-
         self.path_grid = self.pathfinder.find_path(start_grid, goal_grid)
 
         if not self.path_grid:
@@ -584,16 +566,6 @@ class Operate:
 
         self.path_grid = self.pathfinder.simplify(self.path_grid)
         self.path = [self.grid_to_world(gp) for gp in self.path_grid]
-
-        goal_extension = False
-        if "goal" in adjustments and self.path:
-            last_grid = self.world_to_grid(self.path[-1])
-            target_grid_precise = self.world_to_grid(target_world)
-            if self.pathfinder.has_line_of_sight(last_grid, target_grid_precise):
-                if self.path_grid[-1] != target_grid_precise:
-                    self.path_grid.append(target_grid_precise)
-                self.path.append((float(target_world[0]), float(target_world[1])))
-                goal_extension = True
 
         smoothing_msg = ""
         if self.enable_smoothing:
@@ -606,26 +578,15 @@ class Operate:
             self.path = smoothed_path
             smoothing_msg = f" smoothed {original_length}→{len(self.path)}."
 
-        if goal_extension and not self.path:
-            self.path = [(float(target_world[0]), float(target_world[1]))]
-
         densify_before = len(self.path)
         self.path = densify_path(self.path, self.path_densify_spacing)
         if len(self.path) != densify_before:
             smoothing_msg += f" densified {densify_before}→{len(self.path)}."
 
-        if goal_extension:
-            smoothing_msg += " goal anchored."
-
-        if adjustments:
-            adjustment_msg = " adjusted " + "/".join(adjustments) + "."
-        else:
-            adjustment_msg = ""
-
         if not smoothing_msg:
             smoothing_msg = f" {len(self.path)} waypoints."
 
-        self.notification = "A* Path:" + adjustment_msg + smoothing_msg
+        self.notification = "A* Path:" + smoothing_msg
 
         self.current_path_index = 0
         self.require_heading_alignment = len(self.path) > 1

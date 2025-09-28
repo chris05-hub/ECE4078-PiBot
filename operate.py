@@ -6,6 +6,7 @@ import os, sys
 import math
 import json
 import csv
+import ast
 from collections import deque, defaultdict
 from typing import Dict, List, Optional, Tuple
 import numpy as np
@@ -24,7 +25,7 @@ sys.path.insert(0,"{}/cv/".format(os.getcwd()))
 from cv.detector import ObjectDetector
 
 # import object pose utilities (M3)
-from object_pose_est import CLASS_NAME_MAPPING
+import object_pose_est as obj_pose_est
 
 
 MAP_V_PAD = 40
@@ -102,11 +103,17 @@ class Operate:
         self.latest_detections = None
 
         # Object metadata for pose estimation
-        self.object_list, self.object_dimensions = self.load_object_metadata('object_list.csv')
+        self.object_list, self.object_dimensions, self.object_colors = self.load_object_metadata('object_list.csv')
         if not self.object_list:
-            fallback_names = sorted({v for v in CLASS_NAME_MAPPING.values()})
+            fallback_names = sorted({v for v in obj_pose_est.CLASS_NAME_MAPPING.values()})
             self.object_list = fallback_names
             self.object_dimensions = [[0.1, 0.1, 0.1] for _ in fallback_names]
+            self.object_colors = {
+                name: ((idx * 70) % 200 + 40, (idx * 130) % 200 + 40, (idx * 40) % 200 + 40)
+                for idx, name in enumerate(fallback_names)
+            }
+        obj_pose_est.object_list = self.object_list
+        obj_pose_est.object_dimensions = self.object_dimensions
 
         # Search list & fruit bookkeeping
         self.search_targets = self.load_search_targets('search_list.txt')
@@ -136,9 +143,10 @@ class Operate:
             return {}
 
     @staticmethod
-    def load_object_metadata(fname: str) -> Tuple[List[str], List[List[float]]]:
+    def load_object_metadata(fname: str) -> Tuple[List[str], List[List[float]], Dict[str, Tuple[int, int, int]]]:
         object_names: List[str] = []
         dimensions: List[List[float]] = []
+        colors: Dict[str, Tuple[int, int, int]] = {}
         try:
             with open(fname, 'r') as csvfile:
                 reader = csv.DictReader(csvfile)
@@ -154,9 +162,20 @@ class Operate:
                         except (TypeError, ValueError):
                             dims.append(0.0)
                     dimensions.append(dims)
+                    colour_raw = row.get('rgb display', '')
+                    colour_tuple: Tuple[int, int, int]
+                    try:
+                        parsed = ast.literal_eval(str(colour_raw))
+                        colour_tuple = tuple(int(v) for v in parsed[:3])  # type: ignore[index]
+                        if len(colour_tuple) != 3:
+                            raise ValueError
+                    except Exception:
+                        idx = len(object_names) - 1
+                        colour_tuple = ((idx * 70) % 200 + 40, (idx * 130) % 200 + 40, (idx * 40) % 200 + 40)
+                    colors[name] = colour_tuple
         except Exception:
             pass
-        return object_names, dimensions
+        return object_names, dimensions, colors
 
     @staticmethod
     def load_search_targets(fname: str) -> List[str]:
@@ -283,6 +302,7 @@ class Operate:
 
         # paint SLAM outputs
         ekf_view = self.ekf.draw_slam_state(res=(520, 480+v_pad), not_pause = self.ekf_on)
+        self.draw_fruits_on_map(ekf_view)
         canvas.blit(ekf_view, (2*h_pad+320, v_pad))
         robot_view = cv2.resize(self.aruco_img, (320, 240))
         self.draw_pygame_window(canvas, robot_view, position=(h_pad, v_pad))
@@ -314,11 +334,26 @@ class Operate:
         view = pygame.surfarray.make_surface(cv2_img)
         view = pygame.transform.flip(view, True, False)
         canvas.blit(view, position)
-    
     @staticmethod
     def put_caption(canvas, caption, position, text_colour=(200, 200, 200)):
         caption_surface = TITLE_FONT.render(caption, False, text_colour)
         canvas.blit(caption_surface, (position[0], position[1]-25))
+
+    def draw_fruits_on_map(self, surface: pygame.Surface):
+        if not isinstance(surface, pygame.Surface):
+            return
+        if not self.autonomy.fruit_estimates:
+            return
+        robot_state = self.ekf.robot.state.flatten()
+        robot_x, robot_y = float(robot_state[0]), float(robot_state[1])
+        res = (surface.get_width(), surface.get_height())
+        m2pixel = 100
+        for name, (fx, fy) in self.autonomy.fruit_estimates.items():
+            rel_x = fx - robot_x
+            rel_y = fy - robot_y
+            map_pt = self.ekf.to_im_coor((rel_x, rel_y), res, m2pixel)
+            color = self.object_colors.get(name, (255, 165, 0))
+            pygame.draw.circle(surface, color, map_pt, 6)
 
     # Keyboard teleoperation
     # For pibot motion, set two numbers for the self.command['wheel_speed']. Eg self.command['wheel_speed'] = [0.6, 0.6]
@@ -465,7 +500,9 @@ class AutonomyManager:
         self.scan_phase = 'idle'
         self.scan_step = 0
         self.phase_end_time = 0.0
-        self.segment_start_yaw = 0.0
+        self.scan_initial_yaw = 0.0
+        self.scan_last_yaw = 0.0
+        self.scan_accum_yaw = 0.0
         self.segment_target_delta = (2.0 * math.pi) / self.SCAN_SEGMENTS
         self.pending_pose_estimates: List[Tuple[float, float, float]] = []
         self.current_command: Optional[List[float]] = None
@@ -479,6 +516,7 @@ class AutonomyManager:
         self.fruit_samples: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
         self.marker_positions = self._extract_marker_positions(operate.true_map)
         self.manual_goal_active = False
+        self.display_names: Dict[str, str] = {v: k for k, v in obj_pose_est.CLASS_NAME_MAPPING.items()}
 
     @staticmethod
     def _extract_marker_positions(true_map: Dict[str, Dict[str, float]]) -> List[Tuple[float, float]]:
@@ -491,12 +529,8 @@ class AutonomyManager:
     def _get_robot_yaw(self) -> float:
         return float(self.op.ekf.robot.state[2, 0])
 
-    @staticmethod
-    def _positive_angle_diff(angle: float, reference: float) -> float:
-        diff = math.atan2(math.sin(angle - reference), math.cos(angle - reference))
-        if diff < 0:
-            diff += 2.0 * math.pi
-        return diff
+    def _pretty_name(self, canonical: str) -> str:
+        return self.display_names.get(canonical, canonical)
 
     def start_localization_scan(self):
         self.localization_started = True
@@ -504,7 +538,10 @@ class AutonomyManager:
         self.scan_phase = 'rotate'
         self.scan_step = 0
         self.phase_end_time = 0.0
-        self.segment_start_yaw = self._get_robot_yaw()
+        current_yaw = self._get_robot_yaw()
+        self.scan_initial_yaw = current_yaw
+        self.scan_last_yaw = current_yaw
+        self.scan_accum_yaw = 0.0
         self.pending_pose_estimates.clear()
         self.op.notification = 'Initial localization scan in progress...'
         self.current_command = [-self.SCAN_SPEED, self.SCAN_SPEED]
@@ -515,12 +552,20 @@ class AutonomyManager:
         self.goal_queue.clear()
         self.goal_name_queue.clear()
         for target in self.op.search_targets:
-            self.goal_name_queue.append(target)
+            canonical = str(target).strip().lower()
+            if not canonical:
+                continue
+            self.goal_name_queue.append(canonical)
         self.autonomous_enabled = True
         self.manual_goal_active = False
+        self.goal_wait_start = None
+        self._refresh_goal_queue()
         self._advance_goal()
         if self.current_goal:
-            self.op.notification = f'Autonomous search: heading to {self.current_goal["name"]}'
+            pretty = self._pretty_name(self.current_goal['name'])
+            self.op.notification = f'Autonomous search: heading to {pretty}'
+        elif self.goal_name_queue:
+            self.op.notification = 'Autonomous search: waiting for fruit localisation'
 
     def set_manual_goal(self, goal_pos: Tuple[float, float]):
         self.goal_queue.clear()
@@ -568,10 +613,21 @@ class AutonomyManager:
 
     def _update_localization(self, sensor_measurement):
         now = time.time()
+        current_yaw = self._get_robot_yaw()
+        delta = current_yaw - self.scan_last_yaw
+        while delta <= -math.pi:
+            delta += 2.0 * math.pi
+        while delta > math.pi:
+            delta -= 2.0 * math.pi
+        if self.scan_phase == 'rotate':
+            if delta < 0:
+                delta = 0.0
+            self.scan_accum_yaw += delta
+        self.scan_last_yaw = current_yaw
         if self.scan_phase == 'rotate':
             self.current_command = [-self.SCAN_SPEED, self.SCAN_SPEED]
-            delta = self._positive_angle_diff(self._get_robot_yaw(), self.segment_start_yaw)
-            if delta >= self.segment_target_delta - self.SCAN_ANGLE_TOL:
+            target_total = min((self.scan_step + 1) * self.segment_target_delta, 2.0 * math.pi)
+            if self.scan_accum_yaw >= target_total - self.SCAN_ANGLE_TOL:
                 self.scan_phase = 'pause'
                 self.phase_end_time = now + self.SCAN_PAUSE_DURATION
                 self.current_command = [0.0, 0.0]
@@ -583,7 +639,6 @@ class AutonomyManager:
                     self._finalize_localization()
                     return [0.0, 0.0]
                 self.scan_phase = 'rotate'
-                self.segment_start_yaw = self._get_robot_yaw()
                 self.current_command = [-self.SCAN_SPEED, self.SCAN_SPEED]
         else:
             self.current_command = [0.0, 0.0]
@@ -604,8 +659,14 @@ class AutonomyManager:
             theta = math.atan2(mean_sin, mean_cos)
             self.op.ekf.robot.state = np.array([[x], [y], [theta]])
             self.op.ekf_on = True
+        else:
+            self.op.ekf_on = True
+        self.op.ekf.robot.state[2, 0] = ((float(self.op.ekf.robot.state[2, 0]) + math.pi) % (2.0 * math.pi)) - math.pi
         self.localization_done = True
         self.localization_started = False
+        self.scan_phase = 'idle'
+        self.scan_step = 0
+        self.scan_accum_yaw = 0.0
         self.current_command = [0.0, 0.0]
         self.op.notification = 'Localization complete. Ready for commands.'
         if self.op.search_targets:
@@ -655,96 +716,112 @@ class AutonomyManager:
         avg_y = sum(p[1] for p in positions) / len(positions)
         return avg_x, avg_y, theta
 
+    def _refresh_goal_queue(self):
+        if self.manual_goal_active:
+            return
+        pending = deque()
+        while self.goal_name_queue:
+            name = self.goal_name_queue.popleft()
+            point = self.fruit_estimates.get(name)
+            if point is None:
+                pending.append(name)
+                continue
+            self.goal_queue.append({'name': name, 'point': point})
+        self.goal_name_queue = pending
+        if self.fruit_estimates and self.goal_queue:
+            updated = deque()
+            while self.goal_queue:
+                goal = self.goal_queue.popleft()
+                name = goal.get('name')
+                if isinstance(name, str) and name in self.fruit_estimates:
+                    goal['point'] = self.fruit_estimates[name]
+                updated.append(goal)
+            self.goal_queue = updated
+        if self.current_goal and self.current_goal.get('name') not in (None, 'manual'):
+            name = self.current_goal['name']
+            if name in self.fruit_estimates:
+                self.current_goal['point'] = self.fruit_estimates[name]
+
     def _advance_goal(self):
         if self.manual_goal_active:
             return
+        self._refresh_goal_queue()
         while self.goal_queue:
             goal = self.goal_queue.popleft()
             if goal is not None:
                 self.current_goal = goal
                 self.goal_wait_start = None
-                return
-        while self.goal_name_queue:
-            name = self.goal_name_queue.popleft()
-            goal = self._build_goal_from_name(name)
-            if goal:
-                self.current_goal = goal
-                self.goal_wait_start = None
-                self.op.notification = f'Heading to {goal["name"]}'
+                pretty = self._pretty_name(goal['name'])
+                self.op.notification = f'Heading to {pretty}'
                 return
         self.current_goal = None
-
-    def _build_goal_from_name(self, name: str) -> Optional[Dict[str, object]]:
-        point = self.fruit_estimates.get(name)
-        if point is None:
-            key = f'{name}_0'
-            if key in self.op.true_map:
-                data = self.op.true_map[key]
-                point = (float(data.get('x', 0.0)), float(data.get('y', 0.0)))
-        if point is None:
-            return None
-        return {'name': name, 'point': point}
 
     def on_auto_detections(self, detections: List[dict]):
         if not detections:
             return
-        robot_state = self.op.ekf.robot.state.flatten()
-        robot_x, robot_y, robot_theta = float(robot_state[0]), float(robot_state[1]), float(robot_state[2])
-        focal_length = float(self.op.camera_matrix[0][0]) if self.op.camera_matrix is not None else 1.0
+        processed: List[dict] = []
         for det in detections:
             name = det.get('name')
             if not name:
                 continue
-            mapped = CLASS_NAME_MAPPING.get(name, name.lower())
-            if mapped not in self.op.object_list:
+            if name not in obj_pose_est.CLASS_NAME_MAPPING:
                 continue
-            idx = self.op.object_list.index(mapped)
-            dims = self.op.object_dimensions[idx] if idx < len(self.op.object_dimensions) else [0.1, 0.1, 0.1]
+            conf = float(det.get('conf', 0.0))
+            if conf < 0.5:
+                continue
             bbox = det.get('bbox_xywh')
             if bbox is None:
                 bbox_xyxy = det.get('bbox_xyxy')
                 if bbox_xyxy is None:
                     continue
                 x1, y1, x2, y2 = bbox_xyxy
+                cx = (float(x1) + float(x2)) / 2.0
+                cy = (float(y1) + float(y2)) / 2.0
                 w = max(1.0, float(x2) - float(x1))
                 h = max(1.0, float(y2) - float(y1))
-                cx = float(x1) + w / 2.0
-                cy = float(y1) + h / 2.0
-            else:
-                cx, cy, w, h = bbox
-                w = max(1.0, float(w))
-                h = max(1.0, float(h))
-                cx = float(cx)
-                cy = float(cy)
-            conf = float(det.get('conf', 0.0))
-            if conf < 0.4:
+                bbox = [cx, cy, w, h]
+            processed.append({
+                'name': name,
+                'bbox_xywh': [float(v) for v in bbox],
+                'conf': conf
+            })
+        if not processed:
+            return
+        robot_pose = [float(self.op.ekf.robot.state[0, 0]),
+                      float(self.op.ekf.robot.state[1, 0]),
+                      float(self.op.ekf.robot.state[2, 0])]
+        completed = obj_pose_est.get_image_info({'detections': processed}, robot_pose)
+        if not completed:
+            return
+        pose_dict = obj_pose_est.estimate_pose(self.op.camera_matrix, completed)
+        if not pose_dict:
+            return
+        updated = False
+        for canonical, pose in pose_dict.items():
+            if canonical not in self.op.object_list:
                 continue
-            true_width = dims[1] if len(dims) > 1 else dims[0]
-            true_height = dims[2] if len(dims) > 2 else dims[0]
-            distances = []
-            if true_height > 0:
-                distances.append((true_height * focal_length) / h)
-            if true_width > 0:
-                distances.append((true_width * focal_length) / w)
-            if not distances:
+            fx = pose.get('x')
+            fy = pose.get('y')
+            if fx is None or fy is None:
                 continue
-            if len(distances) == 1:
-                distance = distances[0]
-            else:
-                distance = math.sqrt(distances[0] * distances[1])
-            distance = max(0.1, min(3.0, distance))
-            cx_cam = (cx - self.op.img.shape[1] / 2.0) * distance / focal_length
-            robot_frame_x = distance
-            robot_frame_y = -cx_cam
-            cos_t = math.cos(robot_theta)
-            sin_t = math.sin(robot_theta)
-            world_x = robot_x + (robot_frame_x * cos_t - robot_frame_y * sin_t)
-            world_y = robot_y + (robot_frame_x * sin_t + robot_frame_y * cos_t)
-            self.fruit_samples[mapped].append((world_x, world_y))
-            if len(self.fruit_samples[mapped]) >= 3:
-                avg_x = sum(p[0] for p in self.fruit_samples[mapped]) / len(self.fruit_samples[mapped])
-                avg_y = sum(p[1] for p in self.fruit_samples[mapped]) / len(self.fruit_samples[mapped])
-                self.fruit_estimates[mapped] = (avg_x, avg_y)
+            fx_f = float(fx)
+            fy_f = float(fy)
+            samples = self.fruit_samples[canonical]
+            samples.append((fx_f, fy_f))
+            if len(samples) > 15:
+                del samples[0]
+            avg_x = sum(p[0] for p in samples) / len(samples)
+            avg_y = sum(p[1] for p in samples) / len(samples)
+            previous = self.fruit_estimates.get(canonical)
+            self.fruit_estimates[canonical] = (avg_x, avg_y)
+            if previous is None or math.hypot(previous[0] - avg_x, previous[1] - avg_y) > 0.02:
+                display = self._pretty_name(canonical)
+                print(f'[AUTO] mapped {display} at ({avg_x:.2f}, {avg_y:.2f})')
+            updated = True
+        if updated:
+            self._refresh_goal_queue()
+            if self.autonomous_enabled and self.current_goal is None and self.goal_queue:
+                self._advance_goal()
 
     def _drive_to_goal(self) -> List[float]:
         robot_state = self.op.ekf.robot.state.flatten()
@@ -758,11 +835,13 @@ class AutonomyManager:
             if self.goal_wait_start is None:
                 self.goal_wait_start = time.time()
                 self.op.command['wheel_speed'] = [0.0, 0.0]
-                print(f'[AUTO] Target reached: {self.current_goal["name"]} at ({goal_x:.2f}, {goal_y:.2f})')
-                self.op.notification = f'Reached {self.current_goal["name"]}'
+                pretty = self._pretty_name(self.current_goal['name']) if self.current_goal else 'goal'
+                print(f'[AUTO] Target reached: {pretty} at ({goal_x:.2f}, {goal_y:.2f})')
+                self.op.notification = f'Reached {pretty}'
             elif time.time() - self.goal_wait_start >= self.GOAL_HOLD_TIME:
                 if self.current_goal and self.current_goal['name'] != 'manual':
-                    print(f'[AUTO] Confirmed fruit: {self.current_goal["name"]}')
+                    pretty = self._pretty_name(self.current_goal['name'])
+                    print(f'[AUTO] Confirmed fruit: {pretty}')
                 if self.manual_goal_active:
                     self.autonomous_enabled = False
                     self.current_goal = None

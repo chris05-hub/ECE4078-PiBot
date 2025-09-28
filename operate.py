@@ -35,19 +35,11 @@ class AStarPathfinder:
     ]
 
     def __init__(self, grid: np.ndarray):
-        self.clearance_grid = None
-        self.required_clearance = 0.0
         self.set_grid(grid)
 
     def set_grid(self, grid: np.ndarray):
         self.grid = np.array(grid, dtype=np.uint8)
         self.rows, self.cols = self.grid.shape
-
-    def set_clearance_map(self, clearance_grid: np.ndarray, required_clearance: float = 0.0):
-        if clearance_grid.shape != self.grid.shape:
-            raise ValueError("Clearance grid must match occupancy grid dimensions")
-        self.clearance_grid = np.array(clearance_grid, dtype=float)
-        self.required_clearance = max(0.0, float(required_clearance))
 
     @staticmethod
     def _heuristic(a, b):
@@ -59,19 +51,11 @@ class AStarPathfinder:
     def _is_free(self, r, c):
         return self.grid[r, c] == 0
 
-    def _cell_has_clearance(self, r, c):
-        if self.clearance_grid is None:
-            return True
-        return self.clearance_grid[r, c] >= self.required_clearance
-
-    def is_traversable(self, r, c):
-        return self._is_free(r, c) and self._cell_has_clearance(r, c)
-
     def get_neighbors(self, node):
         r, c = node
         for dr, dc, cost in self._NEIGHBOR_OFFSETS:
             nr, nc = r + dr, c + dc
-            if self._in_bounds(nr, nc) and self.is_traversable(nr, nc):
+            if self._in_bounds(nr, nc) and self._is_free(nr, nc):
                 yield (nr, nc), cost
 
     def has_line_of_sight(self, start, goal):
@@ -86,7 +70,7 @@ class AStarPathfinder:
 
         r, c = r0, c0
         while True:
-            if not self.is_traversable(r, c):
+            if not self._is_free(r, c):
                 return False
             if (r, c) == (r1, c1):
                 return True
@@ -101,7 +85,7 @@ class AStarPathfinder:
     def find_path(self, start, goal):
         if not (self._in_bounds(*start) and self._in_bounds(*goal)):
             return []
-        if not (self.is_traversable(*start) and self.is_traversable(*goal)):
+        if not (self._is_free(*start) and self._is_free(*goal)):
             return []
 
         open_heap = [(0.0, start)]
@@ -190,6 +174,44 @@ def smooth_world_path(path_world, world_to_grid_fn, has_los_fn):
     return cleaned
 
 
+def densify_path(path_world, spacing):
+    """Insert intermediate waypoints so consecutive points remain close."""
+    if len(path_world) < 2:
+        return path_world
+
+    spacing = max(1e-3, float(spacing))
+    dense_path = [path_world[0]]
+
+    for idx in range(1, len(path_world)):
+        start = np.array(dense_path[-1], dtype=float)
+        end = np.array(path_world[idx], dtype=float)
+        segment = end - start
+        seg_len = float(np.linalg.norm(segment))
+
+        if seg_len < spacing:
+            if np.linalg.norm(end - np.array(dense_path[-1], dtype=float)) > 1e-6:
+                dense_path.append((float(end[0]), float(end[1])))
+            continue
+
+        direction = segment / seg_len
+        steps = int(np.floor(seg_len / spacing))
+
+        for step in range(1, steps + 1):
+            point = start + direction * min(seg_len, step * spacing)
+            dense_path.append((float(point[0]), float(point[1])))
+
+        if np.linalg.norm(np.array(dense_path[-1], dtype=float) - end) > 1e-6:
+            dense_path.append((float(end[0]), float(end[1])))
+
+    # Remove any duplicates that may have been appended at segment boundaries
+    cleaned = [dense_path[0]]
+    for point in dense_path[1:]:
+        if np.linalg.norm(np.array(point) - np.array(cleaned[-1])) > 1e-6:
+            cleaned.append(point)
+
+    return cleaned
+
+
 # ===============================
 #     Operate (Combined System)
 # ===============================
@@ -217,22 +239,14 @@ class Operate:
         self.true_map = self.load_true_map()
         self.grid_resolution = 0.05
         self.grid_size = int(2.5 / self.grid_resolution)
+        self.grid_origin = np.array([-1.25, -1.25], dtype=float)
         self.occupancy_grid = np.zeros((self.grid_size, self.grid_size))
         self.path_grid = []
         self.obstacle_radius_m = 0.22
-        self.robot_radius_m = 0.1
-        self.safety_margin_m = 0.04
-        self.minimum_clearance = self.robot_radius_m + 0.02
-        self.clearance_replan_threshold = self.minimum_clearance + 0.02
-        self.caution_clearance = self.clearance_replan_threshold + 0.05
-        self.required_clearance = max(0.02, self.safety_margin_m * 0.5)
-        self.distance_field = None
         self.create_occupancy_grid()
 
         # Pathfinder
         self.pathfinder = AStarPathfinder(self.occupancy_grid)
-        if self.distance_field is not None:
-            self.pathfinder.set_clearance_map(self.distance_field, self.required_clearance)
 
         # Navigation state
         self.autonomous_mode = False
@@ -240,8 +254,6 @@ class Operate:
         self.target_point = None
         self.path = []
         self.current_path_index = 0
-        self.last_replan_time = 0.0
-        self.replan_cooldown = 1.5
 
         # Localization
         self.localization_rotation_speed = 0.3
@@ -252,7 +264,6 @@ class Operate:
         self.saved_path = []
         self.saved_path_index = 0
         self.saved_target = None
-        self.post_goal_localization = False
 
         # Step-wise rotation
         self.rotation_step_duration = 0.3
@@ -282,11 +293,12 @@ class Operate:
         # Smoothing
         self.enable_smoothing = True
         self.smoothing_iterations = 2
+        self.path_densify_spacing = 0.06
 
         # Pure pursuit
         self.use_pure_pursuit = True
-        self.lookahead = 0.25
-        self.pp_max_linear = 0.25  # Reduced from 0.5 to 0.25 (half speed)
+        self.lookahead = 0.18
+        self.pp_max_linear = 0.23  # Reduced top speed for tighter tracking
         self.pp_max_angular = 0.8
         self.pp_speed_gain = 1.2
         self.wp_reached_radius = 0.12
@@ -324,75 +336,35 @@ class Operate:
 
     def create_occupancy_grid(self):
         self.occupancy_grid = np.zeros((self.grid_size, self.grid_size), dtype=np.uint8)
-        inflation_radius = self.obstacle_radius_m + self.robot_radius_m + self.safety_margin_m
-        radius_cells = inflation_radius / self.grid_resolution
-        ceil_radius = max(1, int(np.ceil(radius_cells)))
-
-        radius_sq = radius_cells * radius_cells
+        obstacle_radius = self.obstacle_radius_m
+        grid_radius = max(1, int(np.ceil(obstacle_radius / self.grid_resolution)))
 
         for _, pos in self.true_map.items():
-            grid_x = int((pos['x'] + 1.25) / self.grid_resolution)
-            grid_y = int((pos['y'] + 1.25) / self.grid_resolution)
-            for dx in range(-ceil_radius, ceil_radius + 1):
-                for dy in range(-ceil_radius, ceil_radius + 1):
-                    if dx * dx + dy * dy <= radius_sq:
+            grid_y, grid_x = self.world_to_grid((pos['x'], pos['y']))
+            for dx in range(-grid_radius, grid_radius + 1):
+                for dy in range(-grid_radius, grid_radius + 1):
+                    if dx * dx + dy * dy <= grid_radius * grid_radius:
                         nx, ny = grid_x + dx, grid_y + dy
                         if 0 <= nx < self.grid_size and 0 <= ny < self.grid_size:
                             self.occupancy_grid[ny, nx] = 1
 
-        self.distance_field = self.compute_distance_field(self.occupancy_grid)
-
-    def compute_distance_field(self, grid):
-        rows, cols = grid.shape
-        if not np.any(grid):
-            return np.full((rows, cols), float('inf'), dtype=float)
-
-        dist = np.full((rows, cols), float('inf'), dtype=float)
-        heap = []
-
-        for r in range(rows):
-            for c in range(cols):
-                if grid[r, c]:
-                    dist[r, c] = 0.0
-                    heapq.heappush(heap, (0.0, r, c))
-
-        while heap:
-            d, r, c = heapq.heappop(heap)
-            if d > dist[r, c]:
-                continue
-
-            for dr, dc, cost in AStarPathfinder._NEIGHBOR_OFFSETS:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < rows and 0 <= nc < cols:
-                    nd = d + cost
-                    if nd < dist[nr, nc]:
-                        dist[nr, nc] = nd
-                        heapq.heappush(heap, (nd, nr, nc))
-
-        dist *= self.grid_resolution
-        return dist
+        if hasattr(self, 'pathfinder'):
+            self.pathfinder.set_grid(self.occupancy_grid)
 
     def world_to_grid(self, world_pos):
-        grid_x = int((world_pos[0] + 1.25) / self.grid_resolution)
-        grid_y = int((world_pos[1] + 1.25) / self.grid_resolution)
-        grid_x = max(0, min(grid_x, self.grid_size - 1))
-        grid_y = max(0, min(grid_y, self.grid_size - 1))
-        return (grid_y, grid_x)
+        wx, wy = float(world_pos[0]), float(world_pos[1])
+        gx = (wx - self.grid_origin[0]) / self.grid_resolution
+        gy = (wy - self.grid_origin[1]) / self.grid_resolution
+        col = int(np.clip(np.floor(gx), 0, self.grid_size - 1))
+        row = int(np.clip(np.floor(gy), 0, self.grid_size - 1))
+        return (row, col)
 
     def grid_to_world(self, grid_pos):
-        world_x = grid_pos[1] * self.grid_resolution - 1.25
-        world_y = grid_pos[0] * self.grid_resolution - 1.25
+        col = float(grid_pos[1])
+        row = float(grid_pos[0])
+        world_x = self.grid_origin[0] + (col + 0.5) * self.grid_resolution
+        world_y = self.grid_origin[1] + (row + 0.5) * self.grid_resolution
         return (world_x, world_y)
-
-    def get_clearance_at_position(self, world_pos):
-        if self.distance_field is None:
-            return float('inf')
-
-        grid_pos = self.world_to_grid(world_pos)
-        clearance = self.distance_field[grid_pos[0], grid_pos[1]]
-        if np.isinf(clearance):
-            return float('inf')
-        return float(clearance)
 
     def start_localization(self):
         self.autonomous_mode = True
@@ -419,25 +391,8 @@ class Operate:
             self.saved_target = self.target_point
             self.notification = "Re-localizing position... Step 1/16"
 
-    def start_post_goal_localization(self):
-        if self.post_goal_localization or self.in_relocalization:
-            return
-
-        if not self.localization_complete:
-            return
-
-        self.post_goal_localization = True
-        self.in_relocalization = True
-        self.current_rotation_step = 0
-        self.step_start_time = time.time()
-        self.in_rotation_phase = True
-        self.saved_path = []
-        self.saved_path_index = 0
-        self.saved_target = None
-        self.notification = "Verifying final pose... Step 1/16"
-
     def perform_localization(self):
-        if not self.autonomous_mode and not self.post_goal_localization:
+        if not self.autonomous_mode:
             return
 
         now = time.time()
@@ -469,18 +424,7 @@ class Operate:
                 self.reset_rotation_variables()
                 self.last_relocalization_time = time.time()
 
-                marker_count = len(self.ekf.taglist)
-
-                if self.post_goal_localization:
-                    self.notification = f"Final pose verified! Found {marker_count} markers."
-                    self.post_goal_localization = False
-                    self.saved_path = []
-                    self.saved_path_index = 0
-                    self.saved_target = None
-                    self.autonomous_mode = False
-                    return
-
-                resume_msg = f"Re-localized! Found {marker_count} markers."
+                resume_msg = f"Re-localized! Found {len(self.ekf.taglist)} markers."
 
                 resumed = False
 
@@ -559,14 +503,6 @@ class Operate:
         start_grid = self.world_to_grid(robot_pos)
         goal_grid = self.world_to_grid(target_world)
 
-        if not self.pathfinder.is_traversable(*start_grid):
-            self.notification = "Current pose too close to obstacle for planning!"
-            return False
-
-        if not self.pathfinder.is_traversable(*goal_grid):
-            self.notification = "Target too close to obstacle!"
-            return False
-
         self.path_grid = self.pathfinder.find_path(start_grid, goal_grid)
 
         if not self.path_grid:
@@ -576,20 +512,29 @@ class Operate:
         self.path_grid = self.pathfinder.simplify(self.path_grid)
         self.path = [self.grid_to_world(gp) for gp in self.path_grid]
 
+        smoothing_msg = ""
         if self.enable_smoothing:
             original_length = len(self.path)
-            self.path = smooth_world_path(
+            smoothed_path = smooth_world_path(
                 self.path,
                 self.world_to_grid,
                 self.pathfinder.has_line_of_sight
             )
-            self.notification = f"A* Path: {original_length} → {len(self.path)} waypoints (smoothed)"
-        else:
-            self.notification = f"A* Path: {len(self.path)} waypoints"
+            self.path = smoothed_path
+            smoothing_msg = f" smoothed {original_length}→{len(self.path)}."
+
+        densify_before = len(self.path)
+        self.path = densify_path(self.path, self.path_densify_spacing)
+        if len(self.path) != densify_before:
+            smoothing_msg += f" densified {densify_before}→{len(self.path)}."
+
+        if not smoothing_msg:
+            smoothing_msg = f" {len(self.path)} waypoints."
+
+        self.notification = "A* Path:" + smoothing_msg
 
         self.current_path_index = 0
         self.require_heading_alignment = len(self.path) > 1
-        self.last_replan_time = time.time()
         return True
 
     def _restore_saved_path(self):
@@ -687,10 +632,8 @@ class Operate:
         if not self.path or self.current_path_index >= len(self.path):
             self.command['wheel_speed'] = [0, 0]
             if self.autonomous_mode and not self.in_relocalization:
-                self.notification = "Reached target! Verifying pose..."
-                self.start_post_goal_localization()
+                self.notification = "Reached target!"
                 self.autonomous_mode = False
-                self.target_point = None
             self.require_heading_alignment = False
             return
 
@@ -700,38 +643,13 @@ class Operate:
         goal_x, goal_y = self.path[-1]
         dist_to_goal = np.hypot(goal_x - robot_x, goal_y - robot_y)
 
-        clearance = self.get_clearance_at_position((robot_x, robot_y))
-        now = time.time()
-
-        if (
-            clearance <= self.clearance_replan_threshold
-            and self.target_point is not None
-            and (now - self.last_replan_time) > self.replan_cooldown
-            and dist_to_goal > self.wp_reached_radius
-        ):
-            if self.plan_path_to_target(self.target_point):
-                self.notification = "Re-planned path due to low clearance"
-                return
-            else:
-                self.last_replan_time = now
-
-        if clearance <= self.minimum_clearance:
-            self.command['wheel_speed'] = [0, 0]
-            self.notification = "Clearance too low, stopping for safety!"
-            self.autonomous_mode = False
-            self.require_heading_alignment = False
-            self.target_point = None
-            return
-
         tx, ty = self.path[self.current_path_index]
         if np.hypot(tx - robot_x, ty - robot_y) < self.wp_reached_radius:
             self.current_path_index += 1
             if self.current_path_index >= len(self.path):
                 self.command['wheel_speed'] = [0, 0]
-                self.notification = "Reached target! Verifying pose..."
-                self.start_post_goal_localization()
+                self.notification = "Reached target!"
                 self.autonomous_mode = False
-                self.target_point = None
                 self.require_heading_alignment = False
                 return
 
@@ -746,10 +664,8 @@ class Operate:
             if seg_len_sq > 1e-8 and float(np.dot(to_robot, seg)) > seg_len_sq:
                 self.command['wheel_speed'] = [0, 0]
                 self.current_path_index = len(self.path)
-                self.notification = "Reached target! Verifying pose..."
-                self.start_post_goal_localization()
+                self.notification = "Reached target!"
                 self.autonomous_mode = False
-                self.target_point = None
                 self.require_heading_alignment = False
                 return
 
@@ -827,18 +743,12 @@ class Operate:
             Ld = max(0.05, effective_lookahead)
             kappa = (2.0 * y_r) / (Ld * Ld)
 
-            base_speed = min(self.pp_max_linear, max(0.0, dist_to_goal * self.pp_speed_gain))
-            if self.current_path_index < len(self.path) - 1 and base_speed < 0.08:
-                base_speed = min(self.pp_max_linear, 0.08)
-
-            speed_scale = 1.0
-            if clearance < self.caution_clearance:
-                span = max(self.caution_clearance - self.minimum_clearance, 1e-6)
-                speed_scale = np.clip((clearance - self.minimum_clearance) / span, 0.25, 1.0)
-
-            v = base_speed * speed_scale
-            if self.current_path_index < len(self.path) - 1 and v < 0.05:
-                v = min(self.pp_max_linear, 0.05)
+            curvature = abs(kappa)
+            v = min(self.pp_max_linear, max(0.0, dist_to_goal * self.pp_speed_gain))
+            if curvature > 1e-6:
+                v = min(v, self.pp_max_linear / (1.0 + 2.5 * curvature))
+            if self.current_path_index < len(self.path) - 1 and v < 0.08:
+                v = min(self.pp_max_linear, 0.08)
             omega = np.clip(v * kappa, -self.pp_max_angular, self.pp_max_angular)
 
             baseline = float(self.ekf.robot.baseline)
@@ -849,7 +759,7 @@ class Operate:
         t_rl = self.relocalization_interval - (time.time() - self.last_relocalization_time)
         self.notification = (
             f"Following path: waypoint {self.current_path_index + 1}/{len(self.path)} | "
-            f"Next relocalize: {max(0, t_rl):.1f}s | Clearance: {clearance:.2f} m"
+            f"Next relocalize: {max(0, t_rl):.1f}s"
         )
 
     def handle_slam_click(self, pos):
@@ -1128,20 +1038,16 @@ class Operate:
             sys.exit()
 
     def run_autonomous_system(self):
-        if self.post_goal_localization:
-            self.perform_localization()
-            return
+        if self.autonomous_mode:
+            if self.should_relocalize() and not self.in_relocalization:
+                self.start_relocalization()
 
-        if not self.autonomous_mode:
-            return
-
-        if self.should_relocalize() and not self.in_relocalization:
-            self.start_relocalization()
-
-        if not self.localization_complete or self.in_relocalization:
-            self.perform_localization()
-        else:
-            self.follow_path()
+            if not self.localization_complete:
+                self.perform_localization()
+            elif self.in_relocalization:
+                self.perform_localization()
+            else:
+                self.follow_path()
 
 
 if __name__ == "__main__":

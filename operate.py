@@ -289,7 +289,7 @@ class Operate:
         self.grid_origin = np.array([-1.25, -1.25], dtype=float)
         self.occupancy_grid = np.zeros((self.grid_size, self.grid_size))
         self.path_grid = []
-        self.obstacle_radius_m = 0.22
+        self.obstacle_radius_m = 0.28
         self.create_occupancy_grid()
 
         # Pathfinder
@@ -344,32 +344,36 @@ class Operate:
 
         # Pure pursuit
         self.use_pure_pursuit = True
-        self.lookahead = 0.18
+        self.lookahead = 0.2
         # Pure pursuit speed limits.  The robot was previously capped at a very
         # low forward speed (≈0.08) which was not sufficient to overcome static
         # friction on the wheels.  As a result the robot would spin in place
         # when a new goal was issued but barely translate towards it.  We keep a
-        # conservative maximum speed but introduce an explicit minimum cruise
-        # speed so that the controller always commands enough throttle.
-        self.pp_max_linear = 0.32
-        self.pp_min_linear = 0.16
-        self.pp_final_linear = 0.1
-        self.pp_max_angular = 0.8
-        self.pp_speed_gain = 1.6
+        # conservative maximum speed but introduce explicit lower bounds which
+        # are relaxed again for very tight turns so the robot can slow down for
+        # accuracy instead of swerving aggressively.
+        self.pp_max_linear = 0.3
+        self.pp_min_linear = 0.14
+        self.pp_turning_min_linear = 0.085
+        self.pp_final_linear = 0.095
+        self.pp_max_angular = 0.75
+        self.pp_speed_gain = 1.45
+        self.pp_max_lateral_accel = 0.35  # m/s² limit to slow down on curves
+        self.pp_curvature_slowdown = 0.45
         self.wp_reached_radius = 0.12
         self.require_heading_alignment = False
         self.heading_align_tolerance = 0.12
-        self.heading_align_gain = 2.0
-        self.heading_align_min_speed = 0.12
-        self.heading_align_max_speed = 0.6
-        self.turn_in_place_angle = 0.55
-        self.turn_in_place_gain = 2.4
-        self.turn_in_place_min_speed = 0.12
-        self.turn_in_place_max_speed = 0.65
+        self.heading_align_gain = 1.8
+        self.heading_align_min_speed = 0.1
+        self.heading_align_max_speed = 0.55
+        self.turn_in_place_angle = 0.5
+        self.turn_in_place_gain = 2.0
+        self.turn_in_place_min_speed = 0.1
+        self.turn_in_place_max_speed = 0.6
         self.goal_align_tolerance = 0.12
-        self.goal_align_gain = 2.2
-        self.goal_align_min_speed = 0.12
-        self.goal_align_max_speed = 0.6
+        self.goal_align_gain = 2.0
+        self.goal_align_min_speed = 0.1
+        self.goal_align_max_speed = 0.55
 
         # UI state
         self.quit = False
@@ -566,7 +570,19 @@ class Operate:
         start_grid = self.world_to_grid(robot_pos)
         goal_grid = self.world_to_grid(target_world)
 
-        self.path_grid = self.pathfinder.find_path(start_grid, goal_grid)
+        # If either pose falls within an inflated obstacle, slide to the
+        # nearest free cell before attempting to plan.  This guards against the
+        # start pose being slightly inside a dilated obstacle footprint or the
+        # goal coinciding with a mapped object.
+        clearance_cells = int(np.ceil(0.35 / self.grid_resolution))
+        start_candidate = self.pathfinder.find_nearest_free(start_grid, clearance_cells)
+        goal_candidate = self.pathfinder.find_nearest_free(goal_grid, clearance_cells)
+
+        if start_candidate is None or goal_candidate is None:
+            self.notification = "No navigable space near start/goal!"
+            return False
+
+        self.path_grid = self.pathfinder.find_path(start_candidate, goal_candidate)
 
         if not self.path_grid:
             self.notification = "No path found to target!"
@@ -574,6 +590,8 @@ class Operate:
 
         self.path_grid = self.pathfinder.simplify(self.path_grid)
         self.path = [self.grid_to_world(gp) for gp in self.path_grid]
+        if self.path:
+            self.path[0] = (float(robot_pos[0]), float(robot_pos[1]))
 
         smoothing_msg = ""
         if self.enable_smoothing:
@@ -855,22 +873,27 @@ class Operate:
             kappa = (2.0 * y_r) / (Ld * Ld)
 
             curvature = abs(kappa)
-            v = min(self.pp_max_linear, max(0.0, dist_to_goal * self.pp_speed_gain))
-            if curvature > 1e-6:
-                v = min(v, self.pp_max_linear / (1.0 + 2.5 * curvature))
+            v_target = min(self.pp_max_linear, max(0.0, dist_to_goal * self.pp_speed_gain))
+            turn_min_speed = self.pp_min_linear
 
-            # Ensure we maintain enough forward motion to overcome stiction on
-            # the wheels.  Without this guard the controller could command very
-            # small speeds on long, gentle turns which caused the robot to
-            # rotate almost in place.  We keep a separate lower bound when the
-            # robot is approaching the final waypoint so that it still slows
-            # down for the stop condition handled above.
-            if self.current_path_index < len(self.path) - 1:
-                min_speed = self.pp_min_linear if dist_to_goal > self.wp_reached_radius else self.pp_final_linear
-                v = max(min_speed, v)
+            if curvature > 1e-6:
+                lat_limit = np.sqrt(max(self.pp_max_lateral_accel, 1e-6) / max(curvature, 1e-6))
+                v_target = min(v_target, lat_limit)
+                if curvature >= self.pp_curvature_slowdown:
+                    turn_min_speed = min(turn_min_speed, self.pp_turning_min_linear)
             else:
-                v = max(min(v, self.pp_final_linear), self.pp_final_linear)
-            omega = np.clip(v * kappa, -self.pp_max_angular, self.pp_max_angular)
+                curvature = 0.0
+
+            if self.current_path_index >= len(self.path) - 1:
+                min_speed = self.pp_final_linear
+                v_target = min(v_target, self.pp_final_linear)
+            else:
+                min_speed = turn_min_speed
+                if dist_to_goal <= self.wp_reached_radius * 1.2:
+                    min_speed = min(min_speed, self.pp_final_linear)
+
+            v = max(min_speed, v_target)
+            omega = np.clip(kappa * v, -self.pp_max_angular, self.pp_max_angular)
 
             baseline = float(self.ekf.robot.baseline)
             left = np.clip(v - omega * baseline / 2.0, -self.pp_max_linear, self.pp_max_linear)

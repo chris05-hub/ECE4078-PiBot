@@ -8,6 +8,7 @@ import pygame
 from botconnect import BotConnect
 import json
 import heapq
+from collections import deque
 
 # ---- SLAM components (M2) ----
 sys.path.insert(0, "{}/slam".format(os.getcwd()))
@@ -83,6 +84,9 @@ class AStarPathfinder:
                 c += sc
 
     def find_path(self, start, goal):
+        if start == goal:
+            return [start]
+
         if not (self._in_bounds(*start) and self._in_bounds(*goal)):
             return []
         if not (self._is_free(*start) and self._is_free(*goal)):
@@ -143,6 +147,49 @@ class AStarPathfinder:
             if point != deduped[-1]:
                 deduped.append(point)
         return deduped
+
+    def find_nearest_free(self, node, max_radius=None):
+        """Return the closest unoccupied cell to ``node`` if one exists."""
+        if max_radius is None:
+            max_radius = max(self.rows, self.cols)
+
+        if not self._in_bounds(*node):
+            return None
+
+        if self._is_free(*node):
+            return node
+
+        max_radius = max(1, int(max_radius))
+        visited = set()
+        queue = deque([(node, 0)])
+
+        best_node = None
+        best_dist = float('inf')
+
+        while queue:
+            (r, c), dist = queue.popleft()
+            if dist > max_radius or dist > best_dist:
+                continue
+
+            if (r, c) in visited:
+                continue
+            visited.add((r, c))
+
+            if not self._in_bounds(r, c):
+                continue
+
+            if self._is_free(r, c):
+                if dist < best_dist:
+                    best_dist = dist
+                    best_node = (r, c)
+                continue
+
+            for dr, dc, _ in self._NEIGHBOR_OFFSETS:
+                nr, nc = r + dr, c + dc
+                if (nr, nc) not in visited:
+                    queue.append(((nr, nc), dist + 1))
+
+        return best_node
 
 
 def smooth_world_path(path_world, world_to_grid_fn, has_los_fn):
@@ -307,6 +354,14 @@ class Operate:
         self.heading_align_gain = 2.0
         self.heading_align_min_speed = 0.18
         self.heading_align_max_speed = 0.6
+        self.turn_in_place_angle = 0.55
+        self.turn_in_place_gain = 2.4
+        self.turn_in_place_min_speed = 0.15
+        self.turn_in_place_max_speed = 0.65
+        self.goal_align_tolerance = 0.12
+        self.goal_align_gain = 2.2
+        self.goal_align_min_speed = 0.18
+        self.goal_align_max_speed = 0.6
 
         # UI state
         self.quit = False
@@ -503,6 +558,24 @@ class Operate:
         start_grid = self.world_to_grid(robot_pos)
         goal_grid = self.world_to_grid(target_world)
 
+        original_start = start_grid
+        original_goal = goal_grid
+
+        start_grid_adjusted = self.pathfinder.find_nearest_free(start_grid, max_radius=6)
+        goal_grid_adjusted = self.pathfinder.find_nearest_free(goal_grid, max_radius=10)
+
+        if start_grid_adjusted is None or goal_grid_adjusted is None:
+            self.notification = "No navigable space near start or goal!"
+            return False
+
+        start_grid = start_grid_adjusted
+        goal_grid = goal_grid_adjusted
+        adjustments = []
+        if start_grid != original_start:
+            adjustments.append("start")
+        if goal_grid != original_goal:
+            adjustments.append("goal")
+
         self.path_grid = self.pathfinder.find_path(start_grid, goal_grid)
 
         if not self.path_grid:
@@ -511,6 +584,16 @@ class Operate:
 
         self.path_grid = self.pathfinder.simplify(self.path_grid)
         self.path = [self.grid_to_world(gp) for gp in self.path_grid]
+
+        goal_extension = False
+        if "goal" in adjustments and self.path:
+            last_grid = self.world_to_grid(self.path[-1])
+            target_grid_precise = self.world_to_grid(target_world)
+            if self.pathfinder.has_line_of_sight(last_grid, target_grid_precise):
+                if self.path_grid[-1] != target_grid_precise:
+                    self.path_grid.append(target_grid_precise)
+                self.path.append((float(target_world[0]), float(target_world[1])))
+                goal_extension = True
 
         smoothing_msg = ""
         if self.enable_smoothing:
@@ -523,19 +606,34 @@ class Operate:
             self.path = smoothed_path
             smoothing_msg = f" smoothed {original_length}→{len(self.path)}."
 
+        if goal_extension and not self.path:
+            self.path = [(float(target_world[0]), float(target_world[1]))]
+
         densify_before = len(self.path)
         self.path = densify_path(self.path, self.path_densify_spacing)
         if len(self.path) != densify_before:
             smoothing_msg += f" densified {densify_before}→{len(self.path)}."
 
+        if goal_extension:
+            smoothing_msg += " goal anchored."
+
+        if adjustments:
+            adjustment_msg = " adjusted " + "/".join(adjustments) + "."
+        else:
+            adjustment_msg = ""
+
         if not smoothing_msg:
             smoothing_msg = f" {len(self.path)} waypoints."
 
-        self.notification = "A* Path:" + smoothing_msg
+        self.notification = "A* Path:" + adjustment_msg + smoothing_msg
 
         self.current_path_index = 0
         self.require_heading_alignment = len(self.path) > 1
         return True
+
+    @staticmethod
+    def _wrap_angle(angle):
+        return (angle + np.pi) % (2 * np.pi) - np.pi
 
     def _restore_saved_path(self):
         if not self.saved_path:
@@ -643,6 +741,36 @@ class Operate:
         goal_x, goal_y = self.path[-1]
         dist_to_goal = np.hypot(goal_x - robot_x, goal_y - robot_y)
 
+        if dist_to_goal < self.wp_reached_radius * 1.4:
+            if len(self.path) >= 2:
+                final_vec = np.array(self.path[-1]) - np.array(self.path[-2])
+            else:
+                final_vec = np.array([goal_x - robot_x, goal_y - robot_y])
+
+            if np.linalg.norm(final_vec) > 1e-6:
+                desired_final_theta = float(np.arctan2(final_vec[1], final_vec[0]))
+                angle_error = self._wrap_angle(desired_final_theta - robot_theta)
+                if abs(angle_error) > self.goal_align_tolerance:
+                    turn_speed = np.clip(
+                        angle_error * self.goal_align_gain,
+                        -self.goal_align_max_speed,
+                        self.goal_align_max_speed,
+                    )
+                    if abs(turn_speed) < self.goal_align_min_speed:
+                        sign = 1.0 if (turn_speed if turn_speed != 0 else angle_error) >= 0 else -1.0
+                        turn_speed = self.goal_align_min_speed * sign
+                    self.command['wheel_speed'] = [-turn_speed, turn_speed]
+                    self.notification = "Aligning to goal heading"
+                    return
+
+            if dist_to_goal <= self.wp_reached_radius * 0.6:
+                self.command['wheel_speed'] = [0, 0]
+                self.notification = "Reached target!"
+                self.autonomous_mode = False
+                self.require_heading_alignment = False
+                self.current_path_index = len(self.path)
+                return
+
         tx, ty = self.path[self.current_path_index]
         if np.hypot(tx - robot_x, ty - robot_y) < self.wp_reached_radius:
             self.current_path_index += 1
@@ -739,6 +867,20 @@ class Operate:
 
             x_r = np.cos(robot_theta) * dx + np.sin(robot_theta) * dy
             y_r = -np.sin(robot_theta) * dx + np.cos(robot_theta) * dy
+
+            heading_error = np.arctan2(y_r, x_r)
+            if abs(heading_error) > self.turn_in_place_angle:
+                turn_speed = np.clip(
+                    heading_error * self.turn_in_place_gain,
+                    -self.turn_in_place_max_speed,
+                    self.turn_in_place_max_speed,
+                )
+                if abs(turn_speed) < self.turn_in_place_min_speed:
+                    sign = 1.0 if (turn_speed if turn_speed != 0 else heading_error) >= 0 else -1.0
+                    turn_speed = self.turn_in_place_min_speed * sign
+                self.command['wheel_speed'] = [-turn_speed, turn_speed]
+                self.notification = "Turning toward path"
+                return
 
             Ld = max(0.05, effective_lookahead)
             kappa = (2.0 * y_r) / (Ld * Ld)

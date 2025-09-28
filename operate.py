@@ -198,10 +198,11 @@ class Operate:
                 self.notification = 'Recover failed, need >2 landmarks!'
                 self.ekf_on = False
             self.request_recover_robot = False
-        elif self.ekf_on:
+        else:
             self.ekf.predict(drive_measurement)
-            self.ekf.add_landmarks(sensor_measurement)
-            self.ekf.update(sensor_measurement)
+            if self.ekf_on:
+                self.ekf.add_landmarks(sensor_measurement)
+                self.ekf.update(sensor_measurement)
         return sensor_measurement
             
     def save_result(self):
@@ -448,9 +449,9 @@ class AutonomyManager:
     """Handles localization, autonomous goal tracking, and fruit mapping."""
 
     SCAN_SEGMENTS = 12  # 360 / 30 degrees
-    SCAN_ROTATE_DURATION = 0.8
     SCAN_PAUSE_DURATION = 0.4
     SCAN_SPEED = 0.15
+    SCAN_ANGLE_TOL = math.radians(3.0)
     GOAL_REACH_RADIUS = 0.4
     GOAL_HOLD_TIME = 2.0
     DETECTION_INTERVAL = 1.0
@@ -464,6 +465,8 @@ class AutonomyManager:
         self.scan_phase = 'idle'
         self.scan_step = 0
         self.phase_end_time = 0.0
+        self.segment_start_yaw = 0.0
+        self.segment_target_delta = (2.0 * math.pi) / self.SCAN_SEGMENTS
         self.pending_pose_estimates: List[Tuple[float, float, float]] = []
         self.current_command: Optional[List[float]] = None
         self.autonomous_enabled = False
@@ -485,12 +488,23 @@ class AutonomyManager:
                 positions.append((float(value.get('x', 0.0)), float(value.get('y', 0.0))))
         return positions
 
+    def _get_robot_yaw(self) -> float:
+        return float(self.op.ekf.robot.state[2, 0])
+
+    @staticmethod
+    def _positive_angle_diff(angle: float, reference: float) -> float:
+        diff = math.atan2(math.sin(angle - reference), math.cos(angle - reference))
+        if diff < 0:
+            diff += 2.0 * math.pi
+        return diff
+
     def start_localization_scan(self):
         self.localization_started = True
         self.localization_done = False
         self.scan_phase = 'rotate'
         self.scan_step = 0
-        self.phase_end_time = time.time() + self.SCAN_ROTATE_DURATION
+        self.phase_end_time = 0.0
+        self.segment_start_yaw = self._get_robot_yaw()
         self.pending_pose_estimates.clear()
         self.op.notification = 'Initial localization scan in progress...'
         self.current_command = [-self.SCAN_SPEED, self.SCAN_SPEED]
@@ -556,7 +570,8 @@ class AutonomyManager:
         now = time.time()
         if self.scan_phase == 'rotate':
             self.current_command = [-self.SCAN_SPEED, self.SCAN_SPEED]
-            if now >= self.phase_end_time:
+            delta = self._positive_angle_diff(self._get_robot_yaw(), self.segment_start_yaw)
+            if delta >= self.segment_target_delta - self.SCAN_ANGLE_TOL:
                 self.scan_phase = 'pause'
                 self.phase_end_time = now + self.SCAN_PAUSE_DURATION
                 self.current_command = [0.0, 0.0]
@@ -568,7 +583,8 @@ class AutonomyManager:
                     self._finalize_localization()
                     return [0.0, 0.0]
                 self.scan_phase = 'rotate'
-                self.phase_end_time = now + self.SCAN_ROTATE_DURATION
+                self.segment_start_yaw = self._get_robot_yaw()
+                self.current_command = [-self.SCAN_SPEED, self.SCAN_SPEED]
         else:
             self.current_command = [0.0, 0.0]
 
@@ -592,6 +608,8 @@ class AutonomyManager:
         self.localization_started = False
         self.current_command = [0.0, 0.0]
         self.op.notification = 'Localization complete. Ready for commands.'
+        if self.op.search_targets:
+            self.start_search_sequence()
 
     def _estimate_pose_from_markers(self, sensor_measurement) -> Optional[Tuple[float, float, float]]:
         if not sensor_measurement:

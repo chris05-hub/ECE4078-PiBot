@@ -307,6 +307,14 @@ class Operate:
         self.heading_align_gain = 2.0
         self.heading_align_min_speed = 0.18
         self.heading_align_max_speed = 0.6
+        self.turn_in_place_angle = 0.55
+        self.turn_in_place_gain = 2.4
+        self.turn_in_place_min_speed = 0.15
+        self.turn_in_place_max_speed = 0.65
+        self.goal_align_tolerance = 0.12
+        self.goal_align_gain = 2.2
+        self.goal_align_min_speed = 0.18
+        self.goal_align_max_speed = 0.6
 
         # UI state
         self.quit = False
@@ -537,6 +545,10 @@ class Operate:
         self.require_heading_alignment = len(self.path) > 1
         return True
 
+    @staticmethod
+    def _wrap_angle(angle):
+        return (angle + np.pi) % (2 * np.pi) - np.pi
+
     def _restore_saved_path(self):
         if not self.saved_path:
             return False
@@ -643,6 +655,36 @@ class Operate:
         goal_x, goal_y = self.path[-1]
         dist_to_goal = np.hypot(goal_x - robot_x, goal_y - robot_y)
 
+        if dist_to_goal < self.wp_reached_radius * 1.4:
+            if len(self.path) >= 2:
+                final_vec = np.array(self.path[-1]) - np.array(self.path[-2])
+            else:
+                final_vec = np.array([goal_x - robot_x, goal_y - robot_y])
+
+            if np.linalg.norm(final_vec) > 1e-6:
+                desired_final_theta = float(np.arctan2(final_vec[1], final_vec[0]))
+                angle_error = self._wrap_angle(desired_final_theta - robot_theta)
+                if abs(angle_error) > self.goal_align_tolerance:
+                    turn_speed = np.clip(
+                        angle_error * self.goal_align_gain,
+                        -self.goal_align_max_speed,
+                        self.goal_align_max_speed,
+                    )
+                    if abs(turn_speed) < self.goal_align_min_speed:
+                        sign = 1.0 if (turn_speed if turn_speed != 0 else angle_error) >= 0 else -1.0
+                        turn_speed = self.goal_align_min_speed * sign
+                    self.command['wheel_speed'] = [-turn_speed, turn_speed]
+                    self.notification = "Aligning to goal heading"
+                    return
+
+            if dist_to_goal <= self.wp_reached_radius * 0.6:
+                self.command['wheel_speed'] = [0, 0]
+                self.notification = "Reached target!"
+                self.autonomous_mode = False
+                self.require_heading_alignment = False
+                self.current_path_index = len(self.path)
+                return
+
         tx, ty = self.path[self.current_path_index]
         if np.hypot(tx - robot_x, ty - robot_y) < self.wp_reached_radius:
             self.current_path_index += 1
@@ -739,6 +781,20 @@ class Operate:
 
             x_r = np.cos(robot_theta) * dx + np.sin(robot_theta) * dy
             y_r = -np.sin(robot_theta) * dx + np.cos(robot_theta) * dy
+
+            heading_error = np.arctan2(y_r, x_r)
+            if abs(heading_error) > self.turn_in_place_angle:
+                turn_speed = np.clip(
+                    heading_error * self.turn_in_place_gain,
+                    -self.turn_in_place_max_speed,
+                    self.turn_in_place_max_speed,
+                )
+                if abs(turn_speed) < self.turn_in_place_min_speed:
+                    sign = 1.0 if (turn_speed if turn_speed != 0 else heading_error) >= 0 else -1.0
+                    turn_speed = self.turn_in_place_min_speed * sign
+                self.command['wheel_speed'] = [-turn_speed, turn_speed]
+                self.notification = "Turning toward path"
+                return
 
             Ld = max(0.05, effective_lookahead)
             kappa = (2.0 * y_r) / (Ld * Ld)

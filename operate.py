@@ -134,6 +134,7 @@ class Operate:
             'greenlemon': (34, 139, 34),
             'mango': (255, 215, 0)
         }
+        self.localization_scan_records = []
 
         # Load known marker map into EKF for localization reference
         if self.true_marker_map:
@@ -205,6 +206,8 @@ class Operate:
         scan_steps = 12
         rotate_duration = 0.45
         pause_duration = 0.35
+        step_angle = (2.0 * np.pi) / scan_steps
+        self.localization_scan_records = []
 
         for step in range(scan_steps):
             self.command['wheel_speed'] = [-self.turn_speed * 0.8, self.turn_speed * 0.8]
@@ -225,7 +228,17 @@ class Operate:
                 detections.setdefault(tag, []).append(measurement.position)
 
             if self.obj_detector is not None:
-                self.detect_object(force=True, autop=True)
+                detections_this_step = self.run_object_detector_inference()
+                if detections_this_step:
+                    copied_detections = [dict(d) for d in detections_this_step]
+                    self.localization_scan_records.append({
+                        'step': step,
+                        'detections': copied_detections
+                    })
+                detected_types = len({d['name'] for d in detections_this_step}) if detections_this_step else 0
+                self.notification = (
+                    f'Localization scan {step + 1}/{scan_steps}: {detected_types} fruit type(s)'
+                )
 
             pygame.event.pump()
 
@@ -234,8 +247,10 @@ class Operate:
             self.localization_complete = True
             self.ekf_on = True
             self.notification = 'Localization complete'
+            self.project_localization_fruit_detections(step_angle)
         else:
             self.notification = 'Localization failed: insufficient markers'
+            self.localization_scan_records = []
 
         self.command['wheel_speed'] = [0, 0]
         self.control()
@@ -279,11 +294,30 @@ class Operate:
             self.detect_object(force=True, autop=True)
             self.last_auto_detection = now
 
-    def update_object_map(self, detections):
+    def project_localization_fruit_detections(self, step_angle):
+        if not self.localization_scan_records:
+            return
+
+        base_x = self.ekf.robot.state[0, 0]
+        base_y = self.ekf.robot.state[1, 0]
+        base_theta = self.ekf.robot.state[2, 0]
+
+        for record in self.localization_scan_records:
+            theta = self._wrap_to_pi(base_theta + record['step'] * step_angle)
+            robot_pose = np.array([base_x, base_y, theta], dtype=float)
+            self.update_object_map(record['detections'], robot_pose=robot_pose)
+
+        self.localization_scan_records = []
+
+    def update_object_map(self, detections, robot_pose=None):
         if not detections or not self.object_list or self.camera_matrix is None:
             return
 
-        robot_pose = self.ekf.robot.state.flatten()
+        if robot_pose is None:
+            robot_pose = self.ekf.robot.state.flatten()
+        else:
+            robot_pose = np.asarray(robot_pose, dtype=float)
+
         detection_payload = {'detections': detections}
         completed = get_image_info(detection_payload, robot_pose)
         if not completed:
@@ -404,166 +438,6 @@ class Operate:
             self.ekf.predict(drive_measurement)
             self.ekf.add_landmarks(sensor_measurement)
             self.ekf.update(sensor_measurement)
-
-    def update_autonomous_commands(self):
-        now = time.time()
-        if self.localization_mode:
-            self.handle_localization(now)
-        elif self.autonomous_mode and self.target_point is not None:
-            self.handle_navigation()
-
-    def handle_localization(self, now):
-        # ensure SLAM keeps running during localization
-        if not self.localization_notification_shown:
-            self.notification = 'Performing localization scan...'
-            self.localization_notification_shown = True
-        elapsed = now - self.localization_timer
-        if self.localization_phase == 'rotate':
-            self.command['wheel_speed'] = [-self.localization_rotation_speed, self.localization_rotation_speed]
-            if elapsed >= self.localization_segment_duration:
-                self.localization_phase = 'pause'
-                self.localization_timer = now
-        else:  # pause
-            self.command['wheel_speed'] = [0.0, 0.0]
-            if elapsed >= self.localization_pause_duration:
-                self.localization_segments_done += 1
-                if self.localization_segments_done >= self.localization_segments_target:
-                    self.localization_mode = False
-                    self.localization_complete = True
-                    self.localization_phase = 'pause'
-                    self.command['wheel_speed'] = [0.0, 0.0]
-                    self.ekf.set_localization_only(False)
-                    self.notification = 'Localization complete. Click map to navigate.'
-                else:
-                    self.localization_phase = 'rotate'
-                    self.localization_timer = now
-
-    def handle_navigation(self):
-        state = self.ekf.robot.state.reshape(-1)
-        target_x, target_y = self.target_point
-        dx = target_x - state[0]
-        dy = target_y - state[1]
-        distance = math.hypot(dx, dy)
-        if distance < self.target_tolerance:
-            self.command['wheel_speed'] = [0.0, 0.0]
-            self.autonomous_mode = False
-            self.notification = 'Arrived at destination.'
-            return
-
-        desired_heading = math.atan2(dy, dx)
-        heading_error = self.wrap_angle(desired_heading - state[2])
-
-        linear = max(min(self.nav_linear_gain * distance, 0.4), -0.4)
-        angular = max(min(self.nav_angular_gain * heading_error, 0.6), -0.6)
-
-        left = linear - angular
-        right = linear + angular
-
-        max_mag = max(abs(left), abs(right), 1.0)
-        left /= max_mag
-        right /= max_mag
-
-        self.command['wheel_speed'] = [left, right]
-
-    def schedule_auto_detection(self):
-        if self.obj_detector is None:
-            return
-        if not (self.localization_mode or self.autonomous_mode):
-            return
-        now = time.time()
-        if now - self.last_auto_detection >= self.auto_detection_interval:
-            self.command['run_obj_detector'] = True
-            self.last_auto_detection = now
-
-    def handle_object_mapping(self, detections):
-        if not (self.object_pose_available and detections):
-            return
-        detection_payload = {'detections': []}
-        for det in detections:
-            x1, y1, x2, y2 = map(float, det['bbox_xyxy'])
-            w = max(x2 - x1, 0.0)
-            h = max(y2 - y1, 0.0)
-            cx = x1 + w / 2.0
-            cy = y1 + h / 2.0
-            detection_payload['detections'].append({
-                'name': det['name'],
-                'bbox_xywh': [cx, cy, w, h],
-                'conf': float(det['conf'])
-            })
-
-        robot_pose = self.ekf.robot.state.reshape(-1)
-        completed = object_pose_est.get_image_info(detection_payload, robot_pose)
-        if not completed:
-            return
-        estimated = object_pose_est.estimate_pose(self.camera_matrix, completed)
-        if not estimated:
-            return
-        key = f'frame_{self.auto_detection_counter}'
-        self.object_pose_all_img_dict[key] = estimated
-        self.auto_detection_counter += 1
-        self.object_estimations = object_pose_est.merge_estimations(self.object_pose_all_img_dict)
-
-    def overlay_objects_on_map(self, surface):
-        if not self.object_estimations:
-            return
-        robot_state = self.ekf.robot.state.reshape(-1)
-        res_w, res_h = self.slam_res
-        for obj_name, pose in self.object_estimations.items():
-            if not pose:
-                continue
-            if pose.get('x', 0.0) == 0.0 and pose.get('y', 0.0) == 0.0:
-                continue
-            rel_x = pose['x'] - robot_state[0]
-            rel_y = pose['y'] - robot_state[1]
-            x_canvas, y_canvas = self.ekf.to_im_coor((rel_x, rel_y), (res_w, res_h), 100)
-            x_final = (res_h - 1) - y_canvas
-            y_final = (res_w - 1) - x_canvas
-            if 0 <= x_final < surface.get_width() and 0 <= y_final < surface.get_height():
-                base_name = obj_name.replace('_0', '')
-                colour = self.object_colors.get(base_name, (255, 128, 0))
-                pygame.draw.circle(surface, colour, (x_final, y_final), 6)
-                if LABEL_FONT is not None:
-                    label = LABEL_FONT.render(base_name, False, colour)
-                    surface.blit(label, (x_final + 6, y_final - 6))
-
-        if self.target_point is not None:
-            self.draw_target_marker(surface, self.target_point, robot_state)
-
-    def draw_target_marker(self, surface, target, robot_state=None):
-        if robot_state is None:
-            robot_state = self.ekf.robot.state.reshape(-1)
-        res_w, res_h = self.slam_res
-        rel_x = target[0] - robot_state[0]
-        rel_y = target[1] - robot_state[1]
-        x_canvas, y_canvas = self.ekf.to_im_coor((rel_x, rel_y), (res_w, res_h), 100)
-        x_final = (res_h - 1) - y_canvas
-        y_final = (res_w - 1) - x_canvas
-        if 0 <= x_final < surface.get_width() and 0 <= y_final < surface.get_height():
-            pygame.draw.circle(surface, (0, 0, 255), (x_final, y_final), 8, 2)
-
-    @staticmethod
-    def wrap_angle(angle):
-        return (angle + np.pi) % (2 * np.pi) - np.pi
-
-    def map_click_to_world(self, pos):
-        map_left = 2*self.gui_h_pad + 320
-        map_top = self.gui_v_pad
-        local_x = pos[0] - map_left
-        local_y = pos[1] - map_top
-        if not (0 <= local_x < self.slam_res[0] and 0 <= local_y < self.slam_res[1]):
-            return None
-
-        res_w, res_h = self.slam_res
-        x_canvas = res_w - 1 - local_y
-        y_canvas = (res_h - 1) - local_x
-
-        x_rel = -(x_canvas - res_w / 2.0) / 100.0
-        y_rel = (y_canvas - res_h / 2.0) / 100.0
-
-        robot_state = self.ekf.robot.state.reshape(-1)
-        world_x = robot_state[0] + x_rel
-        world_y = robot_state[1] + y_rel
-        return world_x, world_y
             
     def save_result(self):
         # save slam map after pressing "s"
@@ -605,25 +479,7 @@ class Operate:
         if not run_detector:
             return
 
-        # self.img is RGB -> model (OpenCV/YOLO) expects BGR
-        img_bgr = cv2.cvtColor(self.img, cv2.COLOR_RGB2BGR)
-
-        # UPDATED: detector returns (mask, annotated_vis_bgr, detections)
-        pred_mask, vis_bgr, detections = self.obj_detector.detect_single_image(img_bgr)
-
-        # Bring visualization back to RGB for Pygame display
-        self.obj_detector_pred = pred_mask
-        self.cv_vis = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
-
-        # Stash everything needed for saving to pred.txt later
-        H, W = img_bgr.shape[:2]
-        self.obj_detector_output = (
-            self.obj_detector_pred,           # image to save (mask/vis)
-            self.ekf.robot.state.tolist(),    # robot pose (JSON-friendly)
-            detections,                       # list of {name, bbox_xyxy, conf}
-            W,                                # im_w
-            H                                 # im_h
-        )
+        detections = self.run_object_detector_inference()
 
         # Nice notification
         n_types = len({d['name'] for d in detections}) if detections else 0
@@ -638,6 +494,32 @@ class Operate:
 
         # Update mapped fruit positions
         self.update_object_map(detections)
+
+    def run_object_detector_inference(self):
+        if self.obj_detector is None:
+            return []
+
+        # self.img is RGB -> model (OpenCV/YOLO) expects BGR
+        img_bgr = cv2.cvtColor(self.img, cv2.COLOR_RGB2BGR)
+
+        # Detector returns (mask, annotated_vis_bgr, detections)
+        pred_mask, vis_bgr, detections = self.obj_detector.detect_single_image(img_bgr)
+
+        # Bring visualization back to RGB for Pygame display
+        self.obj_detector_pred = pred_mask
+        self.cv_vis = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
+
+        # Stash everything needed for saving
+        H, W = img_bgr.shape[:2]
+        self.obj_detector_output = (
+            self.obj_detector_pred,
+            self.ekf.robot.state.tolist(),
+            detections,
+            W,
+            H
+        )
+
+        return detections
 
 
     # paint the GUI            
@@ -776,14 +658,7 @@ class Operate:
                 elif self.double_reset_comfirm == 1:
                     self.notification = 'SLAM Map is cleared'
                     self.double_reset_comfirm = 0
-                    self.ekf.reset()
-                    self.localization_mode = False
-                    self.localization_complete = False
-                    self.autonomous_mode = False
-                    self.target_point = None
-                    self.object_pose_all_img_dict.clear()
-                    self.object_estimations = {}
-                    self.auto_detection_counter = 0
+                    self.ekf.reset()          
             # run object/fruit detector
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_p:
                 self.command['run_obj_detector'] = True
@@ -832,10 +707,9 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt", default='cv/model/model.best.pt')
     args, _ = parser.parse_known_args()
     
-    pygame.font.init()
+    pygame.font.init() 
     TITLE_FONT = pygame.font.Font('ui/8-BitMadness.ttf', 35)
     TEXT_FONT = pygame.font.Font('ui/8-BitMadness.ttf', 40)
-    LABEL_FONT = pygame.font.Font('ui/8-BitMadness.ttf', 18)
     
     width, height = 700, 660
     canvas = pygame.display.set_mode((width, height))

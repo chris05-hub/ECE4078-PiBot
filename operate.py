@@ -766,10 +766,11 @@ class AutonomyManager:
                 if self.manual_goal_active:
                     self.autonomous_enabled = False
                     self.current_goal = None
+                    self.manual_goal_active = False
                 else:
                     self.current_goal = None
-                    self.goal_wait_start = None
                     self._advance_goal()
+                self.goal_wait_start = None
             return [0.0, 0.0]
 
         target_theta = math.atan2(dy, dx)

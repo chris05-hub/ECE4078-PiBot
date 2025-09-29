@@ -105,8 +105,13 @@ class Operate:
         self.ekf.set_object_display_names({name: meta['display'] for name, meta in self.object_meta.items()})
 
         # localisation scan setup
-        self.localization_speed = 0.18
-        self.localization_sequence = self._create_localization_sequence()
+        self.localization_speed = args.localization_speed
+        rotations = max(args.localization_rotations, 0.0)
+        steps_per_rotation = 12
+        total_steps = int(round(steps_per_rotation * rotations))
+        if rotations > 0 and total_steps == 0:
+            total_steps = 1
+        self.localization_sequence = self._create_localization_sequence(steps=total_steps)
         self.localization_action = None
         self.localization_action_end = 0.0
         self.localization_complete = False
@@ -143,8 +148,11 @@ class Operate:
                 }
         return meta
 
-    def _create_localization_sequence(self, steps=12, rotate_time=0.7, pause_time=0.5):
+    def _create_localization_sequence(self, steps, rotate_time=0.7, pause_time=0.5):
         sequence = deque()
+        if steps <= 0:
+            sequence.append(('final_pause', 0.5))
+            return sequence
         for _ in range(steps):
             sequence.append(('rotate', rotate_time))
             sequence.append(('pause', pause_time))
@@ -448,6 +456,10 @@ if __name__ == "__main__":
     parser.add_argument("--ip", metavar='', type=str, default='localhost') # you can hardcode ip here, but it may change from time to time.
     parser.add_argument("--calib_dir", type=str, default="calibration/param/")
     parser.add_argument("--ckpt", default='cv/model/model.best.pt')
+    parser.add_argument("--localization-rotations", type=float, default=1.0,
+                        help='Number of full rotations to perform during the initial localization scan')
+    parser.add_argument("--localization-speed", type=float, default=0.25,
+                        help='Wheel speed magnitude used during localization spins')
     args, _ = parser.parse_known_args()
     
     pygame.font.init() 

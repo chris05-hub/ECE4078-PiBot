@@ -35,11 +35,15 @@ class EKF:
         self.lm_pics = []
         for i in range(1, 11):
             f_ = f'./ui/8bit/lm_{i}.png'
-            self.lm_pics.append(pygame.image.load(f_))
+        self.lm_pics.append(pygame.image.load(f_))
         f_ = f'./ui/8bit/lm_unknown.png'
         self.lm_pics.append(pygame.image.load(f_))
         self.pibot_pic = pygame.image.load(f'./ui/8bit/pibot_top.png')
         self.localization_only = False  # freeze map if True
+        self.object_estimates = {}
+        self.object_colours = {}
+        self.object_display_names = {}
+        self._object_font = None
         
     def reset(self):
         self.robot.state = np.zeros((3, 1))
@@ -115,6 +119,19 @@ class EKF:
                 d["aruco" + str(tag) + "_0"] = {"x": self.markers[0,i], "y":self.markers[1,i]}
         with open(fname, 'w') as map_f:
             json.dump(d, map_f, indent=4)
+
+    def set_object_colour_map(self, colour_map):
+        self.object_colours = dict(colour_map)
+
+    def set_object_display_names(self, display_map):
+        self.object_display_names = dict(display_map)
+
+    def update_object_estimate(self, name, position):
+        if position is None:
+            if name in self.object_estimates:
+                del self.object_estimates[name]
+            return
+        self.object_estimates[name] = np.asarray(position, dtype=float)
 
     def recover_from_pause(self, sensor_measurement):
         if not sensor_measurement:
@@ -344,6 +361,23 @@ class EKF:
                     surface.blit(self.lm_pics[self.taglist[i]-1], (coor_[0]-5, coor_[1]-5))
                 except IndexError:
                     surface.blit(self.lm_pics[-1], (coor_[0]-5, coor_[1]-5))
+        if self.object_estimates:
+            if self._object_font is None:
+                default_font = pygame.font.get_default_font()
+                self._object_font = pygame.font.Font(default_font, 16)
+            for name, pos in self.object_estimates.items():
+                if pos is None or len(pos) < 2:
+                    continue
+                rel_xy = pos[:2] - self.robot.state[:2, 0]
+                coor_ = self.to_im_coor((rel_xy[0], rel_xy[1]), res, m2pixel)
+                colour = self.object_colours.get(name, (20, 20, 20))
+                colour = tuple(int(np.clip(c, 0, 255)) for c in colour)
+                pygame.draw.circle(surface, colour, coor_, 6)
+                label = self.object_display_names.get(name, name)
+                label_surface = self._object_font.render(label, False, (int(min(colour[0]+80, 255)),
+                                                                       int(min(colour[1]+80, 255)),
+                                                                       int(min(colour[2]+80, 255))))
+                surface.blit(label_surface, (coor_[0] - label_surface.get_width()//2, coor_[1] + 8))
         return surface
 
     @staticmethod

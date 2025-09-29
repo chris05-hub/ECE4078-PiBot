@@ -1,8 +1,10 @@
-import cv2 
+import cv2
 import time
 import shutil
 import argparse
+import csv
 import os, sys
+from collections import deque
 import numpy as np
 import pygame # python package for GUI
 from botconnect import BotConnect # access the robot communication
@@ -18,6 +20,9 @@ from slam.aruco_sensor import ArucoSensor
 sys.path.insert(0,"{}/cv/".format(os.getcwd()))
 from cv.detector import ObjectDetector
 
+# object pose estimation utilities
+import object_pose_est as obj_pose_est
+
 
 class Operate:
     def __init__(self, args):
@@ -26,7 +31,7 @@ class Operate:
         self.botconnect = BotConnect(args.ip)
         self.command = {'wheel_speed':[0, 0], # left wheel speed, right wheel speed
                         'save_slam': False,
-                        'run_obj_detector': False,                       
+                        'run_obj_detector': False,
                         'save_obj_detector': False,
                         'save_image': False}
                         
@@ -41,7 +46,22 @@ class Operate:
         # Initialise SLAM parameters (M2)
         self.ekf = self.init_ekf(args.calib_dir, args.ip)
         self.aruco_sensor = ArucoSensor(self.ekf.robot, marker_length=0.06) # size of the ARUCO markers (6cm)
-        
+
+        # load prior map for localization if available
+        self.true_map_path = os.path.join(os.getcwd(), 'truemap.txt')
+        self.notification = 'Initialising...'
+        try:
+            if os.path.exists(self.true_map_path):
+                self.ekf.load_map(self.true_map_path)
+                self.notification = 'Loaded reference map. Performing localization scan.'
+            else:
+                self.notification = 'Reference map not found. Performing exploratory localization.'
+        except Exception as exc:
+            self.notification = f'Failed to load reference map: {exc}'
+
+        # freeze landmarks while we localize against the provided map
+        self.ekf.set_localization_only(True)
+
         # Initialise detector (M3)
         if args.ckpt == "":
             self.obj_detector = None
@@ -65,26 +85,99 @@ class Operate:
         self.pred_fname = ''
         self.request_recover_robot = False
         self.obj_detector_output = None
-        self.ekf_on = False
+        self.ekf_on = True
         self.double_reset_comfirm = 0
         self.image_id = 0
-        self.notification = 'Press ENTER to start SLAM'
         self.count_down = 300 # 5 min timer
         self.start_time = time.time()
         self.control_clock = time.time()
         self.img = np.zeros([480,640,3], dtype=np.uint8)
         self.aruco_img = np.zeros([480,640,3], dtype=np.uint8)
-        self.obj_detector_pred = np.zeros([480,640], dtype=np.uint8)        
+        self.obj_detector_pred = np.zeros([480,640], dtype=np.uint8)
         self.bg = pygame.image.load('ui/gui_mask.jpg')
 
+        # prepare object pose estimation assets
+        self.object_meta = self._load_object_metadata('object_list.csv')
+        self.fruit_observations = {name: [] for name in self.object_meta.keys()}
+        obj_pose_est.object_list = list(self.object_meta.keys())
+        obj_pose_est.object_dimensions = [self.object_meta[name]['dimensions'] for name in self.object_meta.keys()]
+        self.ekf.set_object_colour_map({name: meta['colour'] for name, meta in self.object_meta.items()})
+        self.ekf.set_object_display_names({name: meta['display'] for name, meta in self.object_meta.items()})
+
+        # localisation scan setup
+        self.localization_speed = 0.18
+        self.localization_sequence = self._create_localization_sequence()
+        self.localization_action = None
+        self.localization_action_end = 0.0
+        self.localization_complete = False
+        self.auto_detection_pending = False
+
+
     # wheel control
-    def control(self):       
+    def control(self):
         left_speed, right_speed = self.botconnect.set_velocity(self.command['wheel_speed'])
         dt = time.time() - self.control_clock
         drive_measurement = DriveMeasurement(left_speed, right_speed, dt)
         self.control_clock = time.time()
         return drive_measurement
-    
+
+    def _load_object_metadata(self, csv_path):
+        meta = {}
+        csv_abspath = os.path.join(os.getcwd(), csv_path)
+        if not os.path.exists(csv_abspath):
+            return meta
+        inverse_class_map = {v: k for k, v in obj_pose_est.CLASS_NAME_MAPPING.items()}
+        with open(csv_abspath, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                name = row['object'].strip()
+                colour = tuple(int(c.strip()) for c in row['rgb display'].strip('()').split(','))
+                length = float(row['length(m)'])
+                width = float(row['width(m)'])
+                height = float(row['height(m)'])
+                display_name = inverse_class_map.get(name, name.replace('_', ' ').title())
+                meta[name] = {
+                    'colour': colour,
+                    'dimensions': (length, width, height),
+                    'display': display_name
+                }
+        return meta
+
+    def _create_localization_sequence(self, steps=12, rotate_time=0.7, pause_time=0.5):
+        sequence = deque()
+        for _ in range(steps):
+            sequence.append(('rotate', rotate_time))
+            sequence.append(('pause', pause_time))
+        sequence.append(('final_pause', 0.5))
+        return sequence
+
+    def update_localization_sequence(self):
+        if self.localization_complete or not self.localization_sequence:
+            return
+        now = time.time()
+        if self.localization_action is None:
+            action, duration = self.localization_sequence.popleft()
+            self.localization_action = action
+            self.localization_action_end = now + duration
+            if action == 'rotate':
+                self.command['wheel_speed'] = [self.localization_speed, -self.localization_speed]
+            else:
+                self.command['wheel_speed'] = [0, 0]
+                self.auto_detection_pending = True
+        elif now >= self.localization_action_end:
+            self.localization_action = None
+            if not self.localization_sequence:
+                self.localization_complete = True
+                self.command['wheel_speed'] = [0, 0]
+                self.ekf.set_localization_only(False)
+                self.notification = 'Localization complete. Ready for teleoperation.'
+
+    def consume_auto_detection_request(self):
+        if self.auto_detection_pending:
+            self.auto_detection_pending = False
+            return True
+        return False
+
     # camera control
     def take_pic(self):
         self.img = self.botconnect.get_image()
@@ -151,34 +244,66 @@ class Operate:
             self.notification = f'{f_} is saved'
 
     # using computer vision to detect objects
-    def detect_object(self):
-        if self.command['run_obj_detector'] and self.obj_detector is not None:
-            # self.img is RGB -> model (OpenCV/YOLO) expects BGR
-            img_bgr = cv2.cvtColor(self.img, cv2.COLOR_RGB2BGR)
+    def detect_object(self, force=False, notify=True):
+        if self.obj_detector is None:
+            if not force:
+                return []
+            return []
 
-            # UPDATED: detector returns (mask, annotated_vis_bgr, detections)
-            pred_mask, vis_bgr, detections = self.obj_detector.detect_single_image(img_bgr)
+        should_run = force or self.command['run_obj_detector']
+        if not should_run:
+            return []
 
-            # Bring visualization back to RGB for Pygame display
-            self.obj_detector_pred = pred_mask
-            self.cv_vis = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
+        # self.img is RGB -> model (OpenCV/YOLO) expects BGR
+        img_bgr = cv2.cvtColor(self.img, cv2.COLOR_RGB2BGR)
 
-            # Stash everything needed for saving to pred.txt later
-            H, W = img_bgr.shape[:2]
-            self.obj_detector_output = (
-                self.obj_detector_pred,           # image to save (mask/vis)
-                self.ekf.robot.state.tolist(),    # robot pose (JSON-friendly)
-                detections,                       # list of {name, bbox_xyxy, conf}
-                W,                                # im_w
-                H                                 # im_h
-            )
+        # UPDATED: detector returns (mask, annotated_vis_bgr, detections)
+        pred_mask, vis_bgr, detections = self.obj_detector.detect_single_image(img_bgr)
 
-            # Nice notification
+        # Bring visualization back to RGB for Pygame display
+        self.obj_detector_pred = pred_mask
+        self.cv_vis = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
+
+        # Stash everything needed for saving to pred.txt later
+        H, W = img_bgr.shape[:2]
+        self.obj_detector_output = (
+            self.obj_detector_pred,           # image to save (mask/vis)
+            self.ekf.robot.state.tolist(),    # robot pose (JSON-friendly)
+            detections,                       # list of {name, bbox_xyxy, conf}
+            W,                                # im_w
+            H                                 # im_h
+        )
+
+        if notify:
             n_types = len({d['name'] for d in detections}) if detections else 0
             self.notification = f'{n_types} object type(s) detected'
 
-            # Reset the command latch
-            self.command['run_obj_detector'] = False
+        # Reset the command latch regardless of trigger source
+        self.command['run_obj_detector'] = False
+        return detections
+
+    def update_object_estimates(self, detections):
+        if not detections:
+            return
+
+        detection_payload = {'detections': detections}
+        robot_pose = self.ekf.robot.state.flatten().tolist()
+        completed = obj_pose_est.get_image_info(detection_payload, robot_pose)
+        if not completed:
+            return
+
+        camera_matrix = self.ekf.robot.camera_matrix
+        object_pose = obj_pose_est.estimate_pose(camera_matrix, completed)
+
+        for name, pose in object_pose.items():
+            if name not in self.fruit_observations:
+                self.fruit_observations[name] = []
+            obs = self.fruit_observations[name]
+            obs.append(np.array([pose['x'], pose['y']], dtype=float))
+            if len(obs) > 20:
+                obs.pop(0)
+            avg = np.mean(np.stack(obs, axis=0), axis=0)
+            self.ekf.update_object_estimate(name, avg)
 
 
     # paint the GUI            
@@ -359,9 +484,12 @@ if __name__ == "__main__":
     while start:
         operate.update_keyboard()
         operate.take_pic()
+        operate.update_localization_sequence()
         drive_measurement = operate.control()
         operate.perform_slam(drive_measurement)
         operate.save_result()
-        operate.detect_object()
+        force_detection = operate.consume_auto_detection_request()
+        detections = operate.detect_object(force=force_detection, notify=not force_detection)
+        operate.update_object_estimates(detections)
         operate.draw(canvas)
         pygame.display.update()

@@ -42,6 +42,7 @@ class Operate:
             self.encoder_ticks_per_meter = encoder_cpr / (math.pi * wheel_diameter)
         self.rotation_active = False
         self.rotation_target_ticks = 0.0
+        self.rotation_target_angle = 0.0
         self.rotation_direction = 1
         self.rotation_speed = 0.25
         self.rotation_start_counts = (0, 0)
@@ -158,6 +159,7 @@ class Operate:
         self.rotation_direction = 1 if angle_rad > 0 else -1
         self.rotation_speed = speed
         self.rotation_target_ticks = target_ticks
+        self.rotation_target_angle = abs(angle_rad)
         self.rotation_start_counts = self.botconnect.get_encoder_counts()
         self.rotation_start_time = time.time()
 
@@ -175,15 +177,32 @@ class Operate:
         current_left, current_right = self.botconnect.get_encoder_counts()
         start_left, start_right = self.rotation_start_counts
 
-        left_progress = abs(current_left - start_left)
-        right_progress = abs(current_right - start_right)
-        progress_ticks = (left_progress + right_progress) / 2.0
+        left_progress = current_left - start_left
+        right_progress = current_right - start_right
+
+        progress_ticks = (abs(left_progress) + abs(right_progress)) / 2.0
+
+        # Convert wheel travel into rotation progress (radians)
+        if self.encoder_ticks_per_meter == 0:
+            left_distance = right_distance = 0.0
+        else:
+            left_distance = left_progress / self.encoder_ticks_per_meter
+            right_distance = right_progress / self.encoder_ticks_per_meter
+
+        if self.ekf.robot.baseline == 0:
+            angle_progress = 0.0
+        else:
+            angle_progress = abs((right_distance - left_distance) / self.ekf.robot.baseline)
 
         elapsed = time.time() - self.rotation_start_time
-        if progress_ticks >= self.rotation_target_ticks or elapsed > self.rotation_timeout:
+        if (
+            angle_progress >= self.rotation_target_angle
+            or progress_ticks >= self.rotation_target_ticks
+            or elapsed > self.rotation_timeout
+        ):
             self.rotation_active = False
             self.command['wheel_speed'] = [0, 0]
-            if progress_ticks >= self.rotation_target_ticks:
+            if angle_progress >= self.rotation_target_angle or progress_ticks >= self.rotation_target_ticks:
                 self.notification = 'Rotation complete'
             else:
                 self.notification = 'Rotation timeout'

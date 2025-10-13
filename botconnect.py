@@ -34,7 +34,7 @@ class BotConnect:
         self.camera_thread.daemon = True
         self.camera_thread.start()
     
-    def set_pid(self, use_pid, kp, ki, kd):
+    def set_pid(self, use_pid, linear_kp, linear_ki, linear_kd, rotation_kp, rotation_ki, rotation_kd):
         """Send PID constants to the robot"""
         try:
             # Open a temporary socket for PID configuration
@@ -42,7 +42,7 @@ class BotConnect:
             pid_socket.connect((self.robot_ip, self.pid_config_port))
             
             # Pack PID constants and send
-            pid_data = struct.pack("!ffff", use_pid, kp, ki, kd)
+            pid_data = struct.pack("!fffffff", use_pid, linear_kp, linear_ki, linear_kd, rotation_kp, rotation_ki, rotation_kd)
             pid_socket.sendall(pid_data)
             
             # Wait for acknowledgment

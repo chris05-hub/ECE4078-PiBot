@@ -28,9 +28,26 @@ class Operate:
         self.botconnect = BotConnect(args.ip)
         self.command = {'wheel_speed':[0, 0], # left wheel speed, right wheel speed
                         'save_slam': False,
-                        'run_obj_detector': False,                       
+                        'run_obj_detector': False,
                         'save_obj_detector': False,
                         'save_image': False}
+
+        # Encoder based motion parameters
+        encoder_cpr = float(os.getenv('PIBOT_ENCODER_CPR', '1440'))
+        wheel_diameter = float(os.getenv('PIBOT_WHEEL_DIAMETER', '0.066'))  # metres
+        ticks_per_meter_env = float(os.getenv('PIBOT_ENCODER_TICKS_PER_METER', '0'))
+        if ticks_per_meter_env > 0:
+            self.encoder_ticks_per_meter = ticks_per_meter_env
+        else:
+            self.encoder_ticks_per_meter = encoder_cpr / (math.pi * wheel_diameter)
+        self.rotation_active = False
+        self.rotation_target_ticks = 0.0
+        self.rotation_target_angle = 0.0
+        self.rotation_direction = 1
+        self.rotation_speed = 0.25
+        self.rotation_start_counts = (0, 0)
+        self.rotation_start_time = 0.0
+        self.rotation_timeout = float(os.getenv('PIBOT_ROTATION_TIMEOUT', '6'))
                         
         # TODO: Tune PID parameters here. If you don't want to use PID, set use_pid=0
         self.botconnect.set_pid(use_pid=1, linear_kp=2.5, linear_ki=0.02, linear_kd=0.0, rotation_kp = 0.3345, rotation_ki = 0.008, rotation_kd = 0.05)
@@ -116,12 +133,86 @@ class Operate:
         self.bg = pygame.image.load('ui/gui_mask.jpg')
 
     # wheel control
-    def control(self):       
+    def control(self):
+        if self.rotation_active:
+            self.update_rotation_task()
         left_speed, right_speed = self.botconnect.set_velocity(self.command['wheel_speed'])
         dt = time.time() - self.control_clock
         drive_measurement = DriveMeasurement(left_speed, right_speed, dt)
         self.control_clock = time.time()
         return drive_measurement
+
+    def start_precise_rotation(self, angle_deg, speed=None):
+        """Start a closed-loop rotation controlled by encoder ticks."""
+        if speed is None:
+            speed = self.rotation_speed
+        speed = max(min(abs(speed), 1.0), 0.05)
+
+        angle_rad = math.radians(angle_deg)
+        if angle_rad == 0:
+            return
+
+        arc_length = abs(angle_rad) * self.ekf.robot.baseline / 2.0
+        target_ticks = arc_length * self.encoder_ticks_per_meter
+
+        self.rotation_active = True
+        self.rotation_direction = 1 if angle_rad > 0 else -1
+        self.rotation_speed = speed
+        self.rotation_target_ticks = target_ticks
+        self.rotation_target_angle = abs(angle_rad)
+        self.rotation_start_counts = self.botconnect.get_encoder_counts()
+        self.rotation_start_time = time.time()
+
+        self.command['wheel_speed'] = [
+            -self.rotation_direction * self.rotation_speed,
+            self.rotation_direction * self.rotation_speed
+        ]
+        self.notification = f'Rotating {angle_deg:.0f}°'
+
+    def update_rotation_task(self):
+        """Update rotation progress and stop when the target angle is reached."""
+        if not self.rotation_active:
+            return
+
+        current_left, current_right = self.botconnect.get_encoder_counts()
+        start_left, start_right = self.rotation_start_counts
+
+        left_progress = current_left - start_left
+        right_progress = current_right - start_right
+
+        progress_ticks = (abs(left_progress) + abs(right_progress)) / 2.0
+
+        # Convert wheel travel into rotation progress (radians)
+        if self.encoder_ticks_per_meter == 0:
+            left_distance = right_distance = 0.0
+        else:
+            left_distance = left_progress / self.encoder_ticks_per_meter
+            right_distance = right_progress / self.encoder_ticks_per_meter
+
+        if self.ekf.robot.baseline == 0:
+            angle_progress = 0.0
+        else:
+            angle_progress = abs((right_distance - left_distance) / self.ekf.robot.baseline)
+
+        elapsed = time.time() - self.rotation_start_time
+        if (
+            angle_progress >= self.rotation_target_angle
+            or progress_ticks >= self.rotation_target_ticks
+            or elapsed > self.rotation_timeout
+        ):
+            self.rotation_active = False
+            self.command['wheel_speed'] = [0, 0]
+            if angle_progress >= self.rotation_target_angle or progress_ticks >= self.rotation_target_ticks:
+                self.notification = 'Rotation complete'
+            else:
+                self.notification = 'Rotation timeout'
+            return
+
+        # Maintain rotation command while active
+        self.command['wheel_speed'] = [
+            -self.rotation_direction * self.rotation_speed,
+            self.rotation_direction * self.rotation_speed
+        ]
     
     # camera control
     def take_pic(self):
@@ -587,8 +678,20 @@ class Operate:
     # The numbers must be between -1 (full speed backward) and 1 (full speed forward). 0 means stop.
     # Study the code in connect.py for more information
     def update_keyboard(self):
+        self.update_rotation_task()
+
         for event in pygame.event.get():
             # drive forward
+            if self.rotation_active and event.type in (pygame.KEYDOWN, pygame.KEYUP):
+                # Allow emergency stop/quit while rotation is running
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
+                    self.rotation_active = False
+                    self.command['wheel_speed'] = [0, 0]
+                    self.notification = 'Rotation cancelled'
+                elif event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE,):
+                    self.quit = True
+                continue
+
             if event.type == pygame.KEYDOWN and event.key == pygame.K_UP:
                 self.command['wheel_speed'] = [0.3, 0.3]
                  # TODO
@@ -606,7 +709,8 @@ class Operate:
                  # TODO
             # stop
             elif event.type == pygame.KEYUP or (event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE):
-                self.command['wheel_speed'] = [0, 0]
+                if not self.rotation_active:
+                    self.command['wheel_speed'] = [0, 0]
             # run SLAM
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_RETURN:
                 n_observed_markers = len(self.ekf.taglist)
@@ -690,6 +794,11 @@ class Operate:
                 with self.fruit_lock:
                     self.estimated_fruits.clear()
                 self.notification = 'Cleared fruit estimates'
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_e:
+                if not self.rotation_active:
+                    self.start_precise_rotation(90.0)
+                else:
+                    self.notification = 'Rotation already in progress'
             # quit
             elif event.type == pygame.QUIT:
                 self.quit = True
